@@ -1,0 +1,2135 @@
+#!/usr/bin/env python3
+import argparse
+import curses
+import datetime
+import json
+import os
+import random
+import re
+import shutil
+import subprocess
+import sys
+import textwrap
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+API_URL = "http://127.0.0.1:11434"
+BASE_DIR = Path.home() / ".local/share/supercode"
+SESS_DIR = BASE_DIR / "sessions"
+CFG_FILE = BASE_DIR / "config.json"
+CONFIG_DIR = Path.home() / ".config/supercode"
+PROVIDERS_FILE = CONFIG_DIR / "config.json"
+SESS_DIR.mkdir(parents=True, exist_ok=True)
+
+PRESETS = {
+    "CODE":     {"temperature": 0.20, "top_p": 0.85, "top_k": 20, "repeat_penalty": 1.15},
+    "BALANCED": {"temperature": 0.55, "top_p": 0.90, "top_k": 40, "repeat_penalty": 1.15},
+    "CREATIVE": {"temperature": 0.85, "top_p": 0.95, "top_k": 65, "repeat_penalty": 1.10},
+}
+
+TIPS = [
+    "Нажмите ctrl+p для открытия палитры команд, сессий и параметров",
+    "Нажмите esc во время ответа нейросети, чтобы прервать генерацию",
+    "Нажмите ctrl+y чтобы скопировать последний ответ ИИ в буфер обмена",
+    "Нажмите f5 (или зажмите Shift) для свободного выделения текста мышкой",
+    "В режиме SMART SSD старый контекст уходит на диск и доступен по //lastcontext",
+]
+
+PROMPT_BUILD = (
+    "Ты — локальный CLI-агент на ПК пользователя в Ubuntu (SuperCode, BUILD). Отвечай кратко на русском.\n"
+    "У тебя ЕСТЬ полный доступ к терминалу и файлам. НИКОГДА не отказывайся и не пиши что у тебя нет доступа!\n"
+    "1) Чтобы выполнить команду bash, напиши с новой строки:\n//run <команда>\n"
+    "2) Чтобы создать или перезаписать файл с кодом, напиши:\n//write <имя_файла>\n<весь код файла>\n//end\n"
+    "3) Если старый контекст выгружен на SSD и нужны детали, напиши:\n//lastcontext"
+)
+PROMPT_PLAN = (
+    "Ты — ИИ-консультант в Ubuntu (SuperCode, PLAN). Отвечай кратко на русском. "
+    "В режиме PLAN ЗАПРЕЩЕНО писать //run и //write. Если нужен старый контекст с SSD, напиши //lastcontext."
+)
+
+def init_msgs(mode):
+    if mode == "PLAN":
+        return [{"role": "system", "content": PROMPT_PLAN}]
+    return [
+        {"role": "system", "content": PROMPT_BUILD},
+        {"role": "user", "content": "покажи файлы"},
+        {"role": "assistant", "content": "Проверяю файлы.\n//run ls -la"},
+        {"role": "user", "content": "Вывод `ls -la`:\ntotal 8\ndrwxr-xr-x 2 user user 4096 ."},
+        {"role": "assistant", "content": "Папка пуста."},
+    ]
+
+DANGER_RE = [
+    r"\brm\s+(-[a-zA-Z]*r[a-zA-Z]*f|-[a-zA-Z]*f[a-zA-Z]*r|--recursive\s+--force)\s+(/|/\*|\*|~|\$HOME)\b",
+    r"\bmkfs(\.[a-z0-9]+)?\b", r"\bdd\s+.*of=/dev/(sd|nvme|hd|vd|mmcblk)",
+    r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:", r">\s*/dev/(sd|nvme|hd|vd|mem|kmem)",
+    r"\b(shutdown|reboot|poweroff|halt|init\s+)\b", r"\bchmod\s+(-R\s+)?(000|777)\s+/\b",
+    r"\bchown\s+-R\s+.*\s+/\b", r"\bmv\s+.*\s+/dev/null\b",
+]
+CAUTION_RE = [
+    r"\bsudo\b", r"\bsu\b", r"\brm\b", r"\brmdir\b", r"\bchmod\b", r"\bchown\b",
+    r"\bapt(-get)?\b", r"\bsnap\b", r"\bdpkg\b", r"\bsystemctl\b", r"\bservice\b",
+    r"\bkill(all)?\b", r"\bpkill\b", r"\b(curl|wget)\s+.*\|\s*(ba)?sh\b",
+    r"\bpip\s+install\b", r"\bnpm\s+install\s+-g\b", r"\bgit\s+(push|reset\s+--hard|clean\s+-f)\b",
+]
+SEC_MODES = ["ASK ALL", "SAFE AUTO", "NO DANGER"]
+SEC_LABELS = {"ASK ALL": "Спрашивать всё", "SAFE AUTO": "Авто + спрос sudo/rm", "NO DANGER": "Запрет опасного"}
+CTX_MODES = ["SMART SSD", "STRICT 4K"]
+
+LOGO = [
+    "█▀▀ █ █ █▀█ █▀▀ █▀█ █▀▀ █▀█ █▀▄ █▀▀",
+    "▀▀█ █ █ █▀▀ █▀▀ █▀▄ █   █ █ █ █ █▀▀",
+    "▀▀▀ ▀▀▀ ▀   ▀▀▀ ▀ ▀ ▀▀▀ ▀▀▀ ▀▀  ▀▀▀",
+]
+
+def shrink_text(text, max_chars=900):
+    lines = text.splitlines()
+    if len(text) <= max_chars and len(lines) <= 22:
+        return text
+    if len(lines) > 22:
+        res = "\n".join(lines[:10]) + f"\n... [сжато {len(lines)-18} строк] ...\n" + "\n".join(lines[-8:])
+        return res[:max_chars] + ("\n...[обрезано]" if len(res) > max_chars else "")
+    return text[:max_chars // 2] + "\n... [сжато] ...\n" + text[-(max_chars // 2):]
+
+def classify_cmd(cmd):
+    c = cmd.strip()
+    if any(re.search(p, c, re.I) for p in DANGER_RE):
+        return "DANGER"
+    if any(re.search(p, c, re.I) for p in CAUTION_RE):
+        return "CAUTION"
+    return "SAFE"
+
+DEFAULT_CONFIG = {
+    "model": "",
+    "providers": {
+        "ollama": {
+            "type": "ollama", "name": "Ollama (локально)", "enabled": True,
+            "baseURL": "http://127.0.0.1:11434", "apiKey": "", "local": True, "free": True,
+            "num_ctx": 8192, "models": [],
+        },
+        "lmstudio": {
+            "type": "openai", "name": "LM Studio (локально)", "enabled": True,
+            "baseURL": "http://127.0.0.1:1234/v1", "apiKey": "lm-studio", "local": True, "free": True,
+            "models": [],
+        },
+        "llamacpp": {
+            "type": "openai", "name": "llama.cpp / vLLM (локально)", "enabled": True,
+            "baseURL": "http://127.0.0.1:8080/v1", "apiKey": "sk-no-key", "local": True, "free": True,
+            "models": [],
+        },
+        "openrouter": {
+            "type": "openai", "name": "OpenRouter (free-модели)", "enabled": True,
+            "baseURL": "https://openrouter.ai/api/v1", "apiKey": "$OPENROUTER_API_KEY", "free": True,
+            "headers": {"HTTP-Referer": "https://github.com/supercode", "X-Title": "SuperCode"},
+            "models": [
+                "deepseek/deepseek-chat-v3.1:free",
+                "z-ai/glm-4.5-air:free",
+                "qwen/qwen3-coder:free",
+                "meta-llama/llama-3.3-70b-instruct:free",
+            ],
+        },
+        "groq": {
+            "type": "openai", "name": "Groq (free tier)", "enabled": True,
+            "baseURL": "https://api.groq.com/openai/v1", "apiKey": "$GROQ_API_KEY", "free": True,
+            "models": ["llama-3.3-70b-versatile", "openai/gpt-oss-120b", "qwen/qwen3-32b"],
+        },
+        "google": {
+            "type": "google", "name": "Google AI Studio (free tier)", "enabled": True,
+            "baseURL": "https://generativelanguage.googleapis.com/v1beta", "apiKey": "$GEMINI_API_KEY", "free": True,
+            "models": ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"],
+        },
+        "cerebras": {
+            "type": "openai", "name": "Cerebras (free tier)", "enabled": True,
+            "baseURL": "https://api.cerebras.ai/v1", "apiKey": "$CEREBRAS_API_KEY", "free": True,
+            "models": ["llama-3.3-70b", "qwen-3-32b"],
+        },
+        "github": {
+            "type": "openai", "name": "GitHub Models (free)", "enabled": True,
+            "baseURL": "https://models.inference.ai.azure.com", "apiKey": "$GITHUB_TOKEN", "free": True,
+            "models": ["gpt-4o", "gpt-4o-mini"],
+        },
+        "anthropic": {
+            "type": "anthropic", "name": "Anthropic", "enabled": True,
+            "baseURL": "https://api.anthropic.com", "apiKey": "$ANTHROPIC_API_KEY", "free": False,
+            "models": ["claude-sonnet-4-5", "claude-haiku-4-5"],
+        },
+        "openai": {
+            "type": "openai", "name": "OpenAI", "enabled": True,
+            "baseURL": "https://api.openai.com/v1", "apiKey": "$OPENAI_API_KEY", "free": False,
+            "models": ["gpt-4o-mini"],
+        },
+        "deepseek": {
+            "type": "openai", "name": "DeepSeek", "enabled": True,
+            "baseURL": "https://api.deepseek.com/v1", "apiKey": "$DEEPSEEK_API_KEY", "free": False,
+            "models": ["deepseek-chat", "deepseek-reasoner"],
+        },
+        "mistral": {
+            "type": "openai", "name": "Mistral", "enabled": True,
+            "baseURL": "https://api.mistral.ai/v1", "apiKey": "$MISTRAL_API_KEY", "free": False,
+            "models": ["mistral-large-latest", "codestral-latest"],
+        },
+    },
+}
+
+
+def default_config_text():
+    return json.dumps(DEFAULT_CONFIG, indent=2, ensure_ascii=False) + "\n"
+
+
+def ensure_providers_file():
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        if not PROVIDERS_FILE.exists():
+            PROVIDERS_FILE.write_text(default_config_text(), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def load_config():
+    ensure_providers_file()
+    try:
+        cfg = json.loads(PROVIDERS_FILE.read_text(encoding="utf-8"))
+        if not isinstance(cfg, dict) or not isinstance(cfg.get("providers"), dict):
+            raise ValueError("bad config")
+    except Exception:
+        cfg = json.loads(default_config_text())
+    for pname, p in cfg["providers"].items():
+        if not isinstance(p, dict):
+            cfg["providers"][pname] = dict(DEFAULT_CONFIG["providers"].get(pname, {}))
+            p = cfg["providers"][pname]
+        if pname in DEFAULT_CONFIG["providers"]:
+            for k, v in DEFAULT_CONFIG["providers"][pname].items():
+                p.setdefault(k, v)
+        key = p.get("apiKey", "")
+        if isinstance(key, str) and key.startswith("$"):
+            p["apiKey"] = os.environ.get(key[1:], "")
+        p["baseURL"] = (p.get("baseURL") or "").rstrip("/")
+    return cfg
+
+
+def check_ollama(base=API_URL):
+    try:
+        with urllib.request.urlopen(f"{base.rstrip('/')}/api/tags", timeout=1) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def ensure_ollama(base=API_URL):
+    if not shutil.which("ollama"):
+        print("\033[93m[SuperCode] Ollama не найдена. Локальные модели недоступны.\033[0m")
+        print("  Установите одной командой: curl -fsSL https://ollama.com/install.sh | sh")
+        return False
+    if check_ollama(base):
+        return True
+    print("\033[93m[SuperCode] Запуск службы Ollama в фоне...\033[0m")
+    subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    for _ in range(15):
+        time.sleep(1)
+        if check_ollama(base):
+            return True
+    print("\033[91m[SuperCode] Не удалось запустить сервер Ollama.\033[0m")
+    return False
+
+
+def discover_ollama_models(base=API_URL, timeout=2):
+    try:
+        with urllib.request.urlopen(f"{base.rstrip('/')}/api/tags", timeout=timeout) as r:
+            return [m["name"] for m in json.loads(r.read().decode()).get("models", [])]
+    except Exception:
+        return []
+
+
+def provider_models(cfg, discover=True):
+    """Единый список моделей: provider/model + метаданные."""
+    out, seen = [], set()
+    for pname, p in cfg.get("providers", {}).items():
+        if p.get("enabled", True) is False:
+            continue
+        models = list(p.get("models") or [])
+        if p.get("type") == "ollama" and discover:
+            for m in discover_ollama_models(p.get("baseURL") or API_URL):
+                if m not in models:
+                    models.append(m)
+        ready = bool(p.get("apiKey")) or bool(p.get("local")) or p.get("type") == "ollama"
+        for model in models:
+            ref = f"{pname}/{model}"
+            if ref in seen:
+                continue
+            seen.add(ref)
+            out.append({
+                "ref": ref, "provider": pname, "model": model,
+                "provider_name": p.get("name", pname),
+                "free": bool(p.get("free")), "local": bool(p.get("local")),
+                "ready": ready,
+            })
+    return out
+
+
+def resolve_model(cfg, ref=None):
+    ref = (ref or cfg.get("model") or "").strip()
+    if "/" in ref:
+        pname, model = ref.split("/", 1)
+        if pname not in cfg.get("providers", {}):
+            pname, model = "ollama", ref
+    else:
+        pname, model = "ollama", ref
+    p = cfg["providers"].get(pname)
+    if not p:
+        raise RuntimeError(f"Провайдер '{pname}' не найден в {PROVIDERS_FILE}")
+    return pname, p, model
+
+
+def choose_start_model(cfg):
+    models = provider_models(cfg)
+    ref = cfg.get("model")
+    if ref and any(m["ref"] == ref for m in models):
+        return ref
+    ready = [m for m in models if m["ready"]]
+    if ready:
+        return ready[0]["ref"]
+    return models[0]["ref"] if models else ""
+
+
+def search_hf_gguf(query):
+    q = urllib.parse.quote(query.strip() or "qwen coder")
+    url = f"https://huggingface.co/api/models?search={q}&filter=gguf&sort=downloads&direction=-1&limit=10"
+    req = urllib.request.Request(url, headers={"User-Agent": "SuperCode/2.2"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        data = json.loads(r.read().decode())
+    return [(m.get("id", ""), m.get("downloads", 0)) for m in data if isinstance(m, dict) and m.get("id")]
+
+
+def _post_json(url, payload, headers=None, timeout=300):
+    h = {"Content-Type": "application/json"}
+    if headers:
+        h.update({k: v for k, v in headers.items() if v})
+    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers=h)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="ignore")
+        body = re.sub(r"\s+", " ", body).strip()[:400]
+        raise RuntimeError(f"HTTP {e.code}: {body}")
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Сеть недоступна: {e.reason}")
+
+
+def chat(cfg, ref, messages, gen_opts):
+    """Единый вызов чата для любого провайдера."""
+    pname, p, model = resolve_model(cfg, ref)
+    typ = p.get("type", "openai")
+    base = (p.get("baseURL") or "").rstrip("/")
+    key = p.get("apiKey") or ""
+    extra = dict(p.get("headers") or {})
+    temp = float(gen_opts.get("temperature", 0.5))
+    topp = float(gen_opts.get("top_p", 0.9))
+
+    if typ == "ollama":
+        opts = {"num_ctx": int(p.get("num_ctx", 8192)), "temperature": temp, "top_p": topp}
+        if gen_opts.get("top_k") is not None:
+            opts["top_k"] = int(gen_opts["top_k"])
+        if gen_opts.get("repeat_penalty") is not None:
+            opts["repeat_penalty"] = float(gen_opts["repeat_penalty"])
+        payload = {"model": model, "messages": messages, "stream": False, "think": bool(gen_opts.get("show_thinking", False)), "options": opts}
+        try:
+            resp = _post_json(f"{base}/api/chat", payload, extra)
+        except RuntimeError as e:
+            if "think" in str(e):
+                payload.pop("think", None)
+                resp = _post_json(f"{base}/api/chat", payload, extra)
+            else:
+                raise
+        msg = resp.get("message") or {}
+        th = (msg.get("thinking") or "").strip()
+        cnt = (msg.get("content") or "").strip()
+        return (f"<think>\n{th}\n</think>\n{cnt}" if th else cnt).strip()
+
+    if typ == "anthropic":
+        sys_txt = "\n".join(m["content"] for m in messages if m.get("role") == "system")
+        msgs = [{"role": m["role"], "content": m["content"]} for m in messages if m.get("role") in ("user", "assistant")]
+        payload = {"model": model, "messages": msgs, "max_tokens": int(gen_opts.get("max_tokens", 4096)), "temperature": temp}
+        if sys_txt:
+            payload["system"] = sys_txt
+        headers = {"x-api-key": key, "anthropic-version": "2023-06-01", **extra}
+        resp = _post_json(f"{base}/v1/messages", payload, headers)
+        return "".join(b.get("text", "") for b in resp.get("content", []) if b.get("type") == "text").strip()
+
+    if typ == "google":
+        sys_txt = "\n".join(m["content"] for m in messages if m.get("role") == "system")
+        contents, system_roles = [], {"system"}
+        for m in messages:
+            if m.get("role") in system_roles:
+                continue
+            role = "model" if m.get("role") == "assistant" else "user"
+            contents.append({"role": role, "parts": [{"text": m.get("content", "")}]})
+        payload = {"contents": contents, "generationConfig": {"temperature": temp, "topP": topp}}
+        if sys_txt:
+            payload["systemInstruction"] = {"parts": [{"text": sys_txt}]}
+        url = f"{base}/models/{urllib.parse.quote(model, safe='')}:generateContent?key={urllib.parse.quote(key)}"
+        resp = _post_json(url, payload, extra)
+        try:
+            return "".join(part.get("text", "") for part in resp["candidates"][0]["content"]["parts"]).strip()
+        except Exception:
+            return ""
+
+    payload = {"model": model, "messages": messages, "stream": False, "temperature": temp, "top_p": topp}
+    if gen_opts.get("max_tokens"):
+        payload["max_tokens"] = int(gen_opts["max_tokens"])
+    headers = dict(extra)
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    resp = _post_json(f"{base}/chat/completions", payload, headers)
+    try:
+        msg = resp["choices"][0]["message"]
+        th = (msg.get("reasoning_content") or "").strip()
+        cnt = (msg.get("content") or "").strip()
+        return (f"<think>\n{th}\n</think>\n{cnt}" if th and cnt else (cnt or th)).strip()
+    except Exception:
+        return ""
+
+
+def chat_stream(cfg, ref, messages, gen_opts, on_chunk=None, abort_ev=None):
+    """Потоковый вызов чата с выводом мыслей и слов в реальном времени."""
+    pname, p, model = resolve_model(cfg, ref)
+    typ = p.get("type", "openai")
+    base = (p.get("baseURL") or "").rstrip("/")
+    key = p.get("apiKey") or ""
+    extra = dict(p.get("headers") or {})
+    temp = float(gen_opts.get("temperature", 0.5))
+    topp = float(gen_opts.get("top_p", 0.9))
+    effort = gen_opts.get("reasoning_effort", "auto")
+    show_th = bool(gen_opts.get("show_thinking", False))
+
+    def _req(url, payload, headers):
+        h = {"Content-Type": "application/json"}
+        h.update({k: v for k, v in headers.items() if v})
+        return urllib.request.Request(url, data=json.dumps(payload).encode(), headers=h)
+
+    if typ == "ollama":
+        opts = {"num_ctx": int(p.get("num_ctx", 8192)), "temperature": temp, "top_p": topp}
+        if gen_opts.get("top_k") is not None:
+            opts["top_k"] = int(gen_opts["top_k"])
+        if gen_opts.get("repeat_penalty") is not None:
+            opts["repeat_penalty"] = float(gen_opts["repeat_penalty"])
+        think_val = effort if effort in ("low", "medium", "high") else show_th
+        payload = {"model": model, "messages": messages, "stream": True, "think": think_val, "options": opts}
+        try:
+            resp = urllib.request.urlopen(_req(f"{base}/api/chat", payload, extra), timeout=300)
+        except urllib.error.HTTPError as e:
+            body = re.sub(r"\s+", " ", e.read().decode(errors="ignore")).strip()[:300]
+            if "think" in body.lower():
+                payload.pop("think", None)
+                resp = urllib.request.urlopen(_req(f"{base}/api/chat", payload, extra), timeout=300)
+            else:
+                raise RuntimeError(f"HTTP {e.code}: {body}")
+        th_buf, cnt_buf = [], []
+        with resp:
+            for raw in resp:
+                if abort_ev and abort_ev.is_set():
+                    break
+                line = raw.decode(errors="ignore").strip()
+                if not line:
+                    continue
+                d = json.loads(line)
+                m = d.get("message") or {}
+                if m.get("thinking"):
+                    th_buf.append(m["thinking"])
+                    if on_chunk:
+                        on_chunk("think", m["thinking"])
+                if m.get("content"):
+                    cnt_buf.append(m["content"])
+                    if on_chunk:
+                        on_chunk("text", m["content"])
+                if d.get("done"):
+                    break
+        th, cnt = "".join(th_buf).strip(), "".join(cnt_buf).strip()
+        return (f"<think>\n{th}\n</think>\n{cnt}" if th else cnt).strip()
+
+    if typ == "openai":
+        payload = {"model": model, "messages": messages, "stream": True, "temperature": temp, "top_p": topp}
+        if effort in ("low", "medium", "high"):
+            payload["reasoning_effort"] = effort
+        headers = dict(extra)
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        try:
+            resp = urllib.request.urlopen(_req(f"{base}/chat/completions", payload, headers), timeout=300)
+        except urllib.error.HTTPError as e:
+            body = re.sub(r"\s+", " ", e.read().decode(errors="ignore")).strip()[:300]
+            raise RuntimeError(f"HTTP {e.code}: {body}")
+        th_buf, cnt_buf = [], []
+        with resp:
+            for raw in resp:
+                if abort_ev and abort_ev.is_set():
+                    break
+                line = raw.decode(errors="ignore").strip()
+                if not line.startswith("data: "):
+                    continue
+                data_s = line[6:].strip()
+                if data_s == "[DONE]":
+                    break
+                d = json.loads(data_s)
+                delta = ((d.get("choices") or [{}]).get("delta") or {})
+                if delta.get("reasoning_content"):
+                    th_buf.append(delta["reasoning_content"])
+                    if on_chunk:
+                        on_chunk("think", delta["reasoning_content"])
+                if delta.get("content"):
+                    cnt_buf.append(delta["content"])
+                    if on_chunk:
+                        on_chunk("text", delta["content"])
+        th, cnt = "".join(th_buf).strip(), "".join(cnt_buf).strip()
+        return (f"<think>\n{th}\n</think>\n{cnt}" if th and cnt else (cnt or th)).strip()
+
+    full = chat(cfg, ref, messages, gen_opts)
+    if on_chunk and full:
+        on_chunk("text", full)
+    return full
+
+
+def parse_reply(reply, allow_run=True, allow_quoted_run=False):
+    """Единый разбор ответа модели на видимый текст и действия //run //write //lastcontext."""
+    thoughts = []
+    def _grab_think(m):
+        if m.group(1).strip():
+            thoughts.append(m.group(1).strip())
+        return ""
+    reply = re.sub(r"<think>(.*?)</think>", _grab_think, reply, flags=re.S)
+    vis, cmd, need_ctx, quoted_run = [], None, False, False
+    write_file, write_buf, in_write, in_code = None, [], False, False
+    for line in reply.splitlines():
+        s = line.strip()
+        if in_write:
+            if s == "//end":
+                in_write = False
+            else:
+                write_buf.append(line)
+            continue
+        if s.startswith("```"):
+            in_code = not in_code
+            vis.append(line)
+            continue
+        if allow_run and allow_quoted_run and cmd is None:
+            if in_code:
+                mq = re.match(r"^\s*//run\s+(.+)$", line)
+                if mq:
+                    cmd, quoted_run = mq.group(1).strip(), True
+                    continue
+            else:
+                mi = re.search(r"`+\s*//run\s+([^`]+?)`+", line)
+                if mi:
+                    cmd, quoted_run = mi.group(1).strip(), True
+                    vis.append(line)
+                    continue
+        if not in_code:
+            mw = re.match(r"^\s*//write\s+(.+)$", line)
+            if mw and write_file is None:
+                write_file = mw.group(1).strip()
+                in_write = True
+                continue
+            if re.match(r"^\s*//lastcon[a-z]*\s*$", line, re.I):
+                need_ctx = True
+                continue
+            if allow_run and cmd is None:
+                m = re.match(r"^\s*//run\s+(.+)$", line)
+                if m:
+                    cmd = m.group(1).strip()
+                    continue
+        vis.append(line)
+    return {
+        "visible": "\n".join(vis).strip(),
+        "thinking": "\n\n".join(thoughts).strip(),
+        "cmd": cmd,
+        "quoted_run": quoted_run,
+        "write": (write_file, write_buf) if write_file else None,
+        "need_ctx": need_ctx,
+    }
+
+
+def headless_agent(cfg, ref, prompt, gen_opts, max_steps=6):
+    msgs = init_msgs("BUILD")
+    msgs.append({"role": "user", "content": prompt})
+    for step in range(max_steps):
+        _, _, model = resolve_model(cfg, ref)
+        print(f"\033[90m[{step + 1}] {model}…\033[0m", file=sys.stderr)
+        try:
+            reply = chat(cfg, ref, msgs, gen_opts)
+        except Exception as e:
+            print(f"\033[91mОшибка: {e}\033[0m", file=sys.stderr)
+            return 1
+        msgs.append({"role": "assistant", "content": reply})
+        a = parse_reply(reply, allow_run=True)
+        if a["visible"]:
+            print(a["visible"])
+        if a["write"]:
+            fp = Path(a["write"][0]).expanduser()
+            try:
+                fp.parent.mkdir(parents=True, exist_ok=True)
+                fp.write_text("\n".join(a["write"][1]), encoding="utf-8")
+                msg = f"Файл {fp} записан ({len(a['write'][1])} строк)."
+                print(f"\033[32m✔ {msg}\033[0m", file=sys.stderr)
+            except Exception as e:
+                msg = f"Ошибка записи: {e}"
+                print(f"\033[91m✘ {msg}\033[0m", file=sys.stderr)
+            msgs.append({"role": "user", "content": msg})
+            continue
+        if a["need_ctx"]:
+            msgs.append({"role": "user", "content": "Старый контекст недоступен в режиме run."})
+            continue
+        if a["cmd"]:
+            cmd = a["cmd"]
+            lvl = classify_cmd(cmd)
+            if lvl == "DANGER":
+                msg = "ЗАБЛОКИРОВАНО: опасная команда."
+                print(f"\033[91m{msg}\033[0m", file=sys.stderr)
+            else:
+                print(f"\033[36m⚙ {cmd}\033[0m", file=sys.stderr)
+                try:
+                    r = subprocess.run(cmd, shell=True, text=True, capture_output=True, timeout=120)
+                    out = (r.stdout + r.stderr).strip() or f"(код {r.returncode})"
+                except Exception as e:
+                    out = f"(ошибка: {e})"
+                print(out)
+                msg = f"Вывод `{cmd}`:\n{shrink_text(out, 900)}"
+            msgs.append({"role": "user", "content": msg})
+            continue
+        break
+    return 0
+
+
+def save_model_choice(ref):
+    try:
+        ensure_providers_file()
+        raw = json.loads(PROVIDERS_FILE.read_text(encoding="utf-8"))
+        raw["model"] = ref
+        PROVIDERS_FILE.write_text(json.dumps(raw, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+
+
+def cmd_models(cfg):
+    models = provider_models(cfg)
+    if not models:
+        print("Моделей нет. Настройте провайдера: supercode auth")
+        return 1
+    cur = cfg.get("model") or ""
+    print(f"{'':2} {'ПРОВАЙДЕР':<22} {'МОДЕЛЬ':<40} СТАТУС")
+    for m in models:
+        mark = "*" if m["ref"] == cur else " "
+        flags = []
+        flags.append("локально" if m["local"] else "облако")
+        flags.append("бесплатно" if m["free"] else "платно")
+        status = "готово" if m["ready"] else "нужен ключ"
+        prov = m["provider_name"][:22]
+        print(f"{mark:2} {prov:<22} {m['ref']:<40} {status} ({', '.join(flags)})")
+    print("\nВыбрать: supercode -m <provider/model>    Настроить: supercode auth")
+    return 0
+
+
+def load_raw_config():
+    ensure_providers_file()
+    try:
+        cfg = json.loads(PROVIDERS_FILE.read_text(encoding="utf-8"))
+        if not isinstance(cfg, dict) or not isinstance(cfg.get("providers"), dict):
+            raise ValueError
+        return cfg
+    except Exception:
+        return json.loads(default_config_text())
+
+
+def cmd_auth(provider=None):
+    cfg = load_raw_config()
+    names = list(cfg.get("providers", {}).keys())
+    if provider and provider not in cfg["providers"]:
+        name = provider
+        cfg["providers"][name] = {"type": "openai", "name": name, "enabled": True,
+                                  "baseURL": "", "apiKey": "", "models": []}
+        names.append(name)
+    if not provider:
+        print("Провайдеры:")
+        for i, n in enumerate(names, 1):
+            p = cfg["providers"][n]
+            mark = "✓" if (p.get("apiKey") or p.get("local")) else "·"
+            print(f"  {i:2}. {mark} {n:<12} {p.get('name', '')}  {p.get('baseURL', '')}")
+        raw = input(f"\nНомер или имя провайдера [1]: ").strip()
+        if not raw:
+            provider = names[0]
+        elif raw.isdigit() and 1 <= int(raw) <= len(names):
+            provider = names[int(raw) - 1]
+        else:
+            provider = raw
+        if provider not in cfg["providers"]:
+            cfg["providers"][provider] = {"type": "openai", "name": provider, "enabled": True,
+                                          "baseURL": "", "apiKey": "", "models": []}
+    p = cfg["providers"][provider]
+    print(f"\nНастройка провайдера: {provider}")
+    base = input(f"  baseURL [{p.get('baseURL', '')}]: ").strip()
+    if base:
+        p["baseURL"] = base.rstrip("/")
+    key = input("  API key (Enter — оставить, '-' — очистить): ").strip()
+    if key == "-":
+        p["apiKey"] = ""
+    elif key:
+        p["apiKey"] = key
+    models = input("  Модели через запятую: ").strip()
+    if models:
+        p["models"] = [m.strip() for m in models.split(",") if m.strip()]
+    raw_type = input(f"  Тип API [openai/ollama/anthropic/google] ({p.get('type', 'openai')}): ").strip()
+    if raw_type:
+        p["type"] = raw_type
+    enabled = input("  Включить? [Y/n]: ").strip().lower()
+    p["enabled"] = enabled not in ("n", "no", "н", "нет")
+    if not cfg.get("model") and p.get("models"):
+        cfg["model"] = f"{provider}/{p['models'][0]}"
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        PROVIDERS_FILE.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        print(f"\n✔ Сохранено: {PROVIDERS_FILE}")
+        print(f"  Текущая модель: {cfg.get('model') or '(не задана)'}")
+    except Exception as e:
+        print(f"Ошибка сохранения: {e}")
+        return 1
+    return 0
+
+
+class SuperCodeTUI:
+    def __init__(self, stdscr, cfg, model):
+        self.stdscr = stdscr
+        self.cfg = cfg
+        self.model = model
+        self.models = [m["ref"] for m in provider_models(cfg, discover=False)]
+        self.mode, self.sec_idx, self.ctx_idx = "BUILD", 1, 0
+        self.preset_name = "BALANCED"
+        self.gen_opts = dict(PRESETS["BALANCED"])
+        self.load_cfg()
+
+        self.buf = ""
+        self.scroll = 0
+        self.status = "Готов"
+        self.tip = random.choice(TIPS)
+        self.log = []
+        self.msgs = init_msgs("BUILD")
+        self.sess_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.sess_title = "Новая сессия"
+        self.archive_file = SESS_DIR / f"archive_{self.sess_id}.txt"
+        self.sess_file = SESS_DIR / f"session_{self.sess_id}.json"
+        self.offloaded_count = 0
+        self.mouse_on = False
+        self.stream_mode = True
+        self.run_in_quotes = False
+        self.show_thinking = False
+        self.think_start = 0.0
+        self.gen_phase = "wait"
+        self._sys_cache = (0.0, [])
+        self.show_sidebar = True
+        self.anim_tick = 0
+        self.user_turns = 0
+        self.is_busy = False
+        self.abort_event = threading.Event()
+        self.pending_ctrl_x = False
+
+        curses.curs_set(1)
+        curses.mousemask(0)
+        self.stdscr.timeout(80)
+        curses.start_color()
+
+        if curses.can_change_color() and curses.COLORS >= 256:
+            curses.init_color(233, 35, 35, 42)
+            curses.init_color(236, 95, 95, 108)
+            curses.init_color(208, 960, 620, 260)
+            curses.init_color(39, 360, 680, 980)
+            bg_main, bg_card, hl_bg, build_fg = 233, 236, 208, 39
+        else:
+            bg_main, bg_card, hl_bg, build_fg = curses.COLOR_BLACK, curses.COLOR_BLACK, curses.COLOR_YELLOW, curses.COLOR_CYAN
+
+        curses.init_pair(1, curses.COLOR_CYAN, bg_main)
+        curses.init_pair(2, curses.COLOR_GREEN, bg_main)
+        curses.init_pair(3, curses.COLOR_YELLOW, bg_main)
+        curses.init_pair(4, curses.COLOR_RED, bg_main)
+        curses.init_pair(5, build_fg, bg_main)
+        curses.init_pair(6, curses.COLOR_BLACK, hl_bg)
+        curses.init_pair(7, curses.COLOR_MAGENTA, bg_main)
+        curses.init_pair(8, curses.COLOR_WHITE, bg_main)
+        curses.init_pair(9, curses.COLOR_WHITE, bg_card)
+        curses.init_pair(10, build_fg, bg_card)
+        curses.init_pair(11, curses.COLOR_YELLOW, bg_card)
+        curses.init_pair(12, build_fg, bg_main)
+        self.stdscr.bkgd(" ", curses.color_pair(8))
+
+        if not self.model:
+            self.add_log(3, "● Ни одной модели не найдено.")
+            self.add_log(1, "Нажмите [Ctrl+D] чтобы скачать локальную модель, или настройте провайдера:")
+            self.add_log(7, f"  supercode auth   (файл: {PROVIDERS_FILE})\n")
+        self.run()
+
+    @property
+    def sec(self):
+        return SEC_MODES[self.sec_idx]
+
+    @property
+    def ctx_mode(self):
+        return CTX_MODES[self.ctx_idx]
+
+    def model_info(self):
+        try:
+            pname, p, model = resolve_model(self.cfg, self.model)
+            return p, model, pname
+        except Exception:
+            return {}, self.model or "", ""
+
+    def model_short(self):
+        return self.model_info()[1] or "нет модели"
+
+    def provider_label(self):
+        p, _, pname = self.model_info()
+        return p.get("name") or pname or "—"
+
+    def model_flag(self):
+        p, _, _ = self.model_info()
+        if p.get("local"):
+            return "local"
+        return "free" if p.get("free") else "cloud"
+
+    def load_cfg(self):
+        if CFG_FILE.exists():
+            try:
+                d = json.loads(CFG_FILE.read_text(encoding="utf-8"))
+                self.preset_name = d.get("preset", self.preset_name)
+                self.gen_opts.update(d.get("gen_opts", {}))
+                self.show_thinking = bool(d.get("show_thinking", False))
+            except Exception:
+                pass
+
+    def save_cfg(self):
+        CFG_FILE.write_text(json.dumps({"preset": self.preset_name, "gen_opts": self.gen_opts, "show_thinking": self.show_thinking}, indent=2), encoding="utf-8")
+
+    def est_tokens(self):
+        return sum(len(m["content"]) for m in self.msgs) // 3
+
+    def save_session(self):
+        data = {
+            "id": self.sess_id,
+            "title": self.sess_title,
+            "cwd": os.getcwd(),
+            "model": self.model,
+            "mode": self.mode,
+            "msgs": self.msgs,
+            "log": self.log[-400:],
+            "offloaded": self.offloaded_count,
+        }
+        self.sess_file.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+    def load_session(self, path):
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        self.sess_id, self.sess_file = data["id"], Path(path)
+        self.sess_title = data.get("title", f"Сессия {self.sess_id[-6:]}")
+        self.archive_file = SESS_DIR / f"archive_{self.sess_id}.txt"
+        self.model = data.get("model", self.model)
+        self.mode = data.get("mode", "BUILD")
+        self.msgs = data.get("msgs", init_msgs(self.mode))
+        self.log = [tuple(x) for x in data.get("log", [])]
+        self.offloaded_count = data.get("offloaded", 0)
+        self.scroll = 0
+        self.add_log(3, f"● Загружена сессия: {self.sess_title}")
+
+    def new_session(self):
+        self.sess_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.sess_title = "Новая сессия"
+        self.sess_file = SESS_DIR / f"session_{self.sess_id}.json"
+        self.archive_file = SESS_DIR / f"archive_{self.sess_id}.txt"
+        self.msgs = init_msgs(self.mode)
+        self.log.clear()
+        self.offloaded_count = 0
+        self.scroll = 0
+        self.user_turns = 0
+        self.tip = random.choice(TIPS)
+
+    def compact_context(self):
+        base_len = 5 if self.mode == "BUILD" else 1
+        if len(self.msgs) <= base_len + 4:
+            return
+        if self.ctx_mode == "STRICT 4K":
+            while self.est_tokens() > 2600 and len(self.msgs) > base_len + 2:
+                self.msgs.pop(base_len)
+            return
+        if self.est_tokens() > 2300:
+            cut = max(2, (len(self.msgs) - base_len) // 2)
+            old_chunk = self.msgs[base_len:base_len + cut]
+            self.msgs = self.msgs[:base_len] + self.msgs[base_len + cut:]
+            lines = [f"[{'User' if m['role']=='user' else 'AI'}]: {shrink_text(m['content'], 350)}" for m in old_chunk]
+            with open(self.archive_file, "a", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n" + ("=" * 30) + "\n")
+            self.offloaded_count += len(old_chunk)
+            note = f"[Системная заметка: {len(old_chunk)} старых сообщ. сжаты и выгружены на SSD. Если нужны детали, напиши //lastcontext]"
+            self.msgs.insert(base_len, {"role": "system", "content": note})
+            self.add_log(3, f"● Контекст сжат: {len(old_chunk)} сообщ. выгружено на SSD")
+
+    def read_last_context(self):
+        if not self.archive_file.exists():
+            msg = "Архив старого контекста на SSD пуст."
+            self.add_log(3, f"[{msg}]")
+            return msg
+        chunk = self.archive_file.read_text(encoding="utf-8")[-1800:]
+        self.add_log(1, f"[Загружено с SSD: {len(chunk)} симв. старого контекста]")
+        return f"Фрагмент старого контекста с SSD:\n{chunk}"
+
+    def show_error_dialog(self, title, message):
+        lines = textwrap.wrap(message, width=54) or [message]
+        while True:
+            self.draw()
+            my, mx = self.stdscr.getmaxyx()
+            w = min(62, mx - 4)
+            h = min(len(lines) + 6, my - 2)
+            y0, x0 = max(1, (my - h) // 2), max(2, (mx - w) // 2)
+            for dy in range(h):
+                try:
+                    self.stdscr.addstr(y0 + dy, x0, " " * w, curses.color_pair(9))
+                except curses.error:
+                    pass
+            try:
+                self.stdscr.addstr(y0 + 1, x0 + 2, f"✘ {title}"[:w - 4], curses.color_pair(4) | curses.A_BOLD)
+                for idx, ln in enumerate(lines[:h - 5]):
+                    self.stdscr.addstr(y0 + 3 + idx, x0 + 2, ln[:w - 4], curses.color_pair(9))
+                btn = "[  OK  ]"
+                self.stdscr.addstr(y0 + h - 2, x0 + max(2, (w - len(btn)) // 2), btn, curses.color_pair(6) | curses.A_BOLD)
+            except curses.error:
+                pass
+            self.stdscr.refresh()
+            ch = self.get_key_blocking()
+            if ch in ("\n", "\r", curses.KEY_ENTER, "\x1b", " "):
+                return
+
+    def check_effort_support(self):
+        p, model, pname = self.model_info()
+        typ = p.get("type", "openai")
+        m_low = model.lower()
+        if typ == "ollama":
+            try:
+                base = (p.get("baseURL") or API_URL).rstrip("/")
+                info = _post_json(f"{base}/api/show", {"name": model}, timeout=5)
+                caps = [c.lower() for c in (info.get("capabilities") or [])]
+                tpl = (info.get("template") or "").lower()
+                if "thinking" in caps or "<think>" in tpl or any(k in m_low for k in ("gpt-oss", "qwen3", "deepseek-r1", "qwq", "r1")):
+                    return True, ""
+                return False, f"Модель '{model}' (Ollama) не поддерживает размышления и уровни усилий (capabilities: {caps or ['completion']})."
+            except Exception as e:
+                return False, f"Не удалось проверить модель в Ollama: {e}"
+        supported_hints = ("o1", "o3", "o4", "gpt-5", "gpt-oss", "deepseek-r", "reasoner", "r1", "qwen3", "qwq", "claude-sonnet-4", "claude-opus-4", "claude-3-7", "gemini-2.5", "gemini-3")
+        if any(k in m_low for k in supported_hints):
+            return True, ""
+        return False, f"Модель '{model}' ({pname}) не поддерживает настройку уровня усилий (Reasoning Effort)."
+
+    def open_effort_selector(self):
+        ok, err_msg = self.check_effort_support()
+        if not ok:
+            self.show_error_dialog("Уровень усилий не поддерживается", err_msg)
+            return
+        levels = [
+            ("auto", "Авто (по умолчанию для модели)"),
+            ("low", "Low — быстрые короткие рассуждения"),
+            ("medium", "Medium — сбалансированная глубина"),
+            ("high", "High — глубокий пошаговый анализ"),
+        ]
+        cur = self.gen_opts.get("reasoning_effort", "auto")
+        sel = next((i for i, (k, _) in enumerate(levels) if k == cur), 0)
+        while True:
+            self.draw()
+            my, mx = self.stdscr.getmaxyx()
+            w, h = min(60, mx - 4), len(levels) + 6
+            y0, x0 = max(1, (my - h) // 2), max(2, (mx - w) // 2)
+            for dy in range(h):
+                try:
+                    self.stdscr.addstr(y0 + dy, x0, " " * w, curses.color_pair(9))
+                except curses.error:
+                    pass
+            try:
+                self.stdscr.addstr(y0 + 1, x0 + 2, f"Уровень усилий · {self.model_short()}"[:w - 4], curses.color_pair(9) | curses.A_BOLD)
+                self.stdscr.addstr(y0 + 1, x0 + w - 5, "esc", curses.color_pair(9) | curses.A_DIM)
+                for idx, (k, desc) in enumerate(levels):
+                    mark = "● " if k == cur else "  "
+                    attr = (curses.color_pair(6) | curses.A_BOLD) if idx == sel else curses.color_pair(9)
+                    self.stdscr.addstr(y0 + 3 + idx, x0 + 2, f"{mark}{desc}"[:w - 4].ljust(w - 4), attr)
+            except curses.error:
+                pass
+            self.stdscr.refresh()
+            ch = self.get_key_blocking()
+            if ch == "\x1b":
+                return
+            elif ch == curses.KEY_UP:
+                sel = (sel - 1) % len(levels)
+            elif ch == curses.KEY_DOWN:
+                sel = (sel + 1) % len(levels)
+            elif ch in ("\n", "\r", curses.KEY_ENTER):
+                chosen = levels[sel][0]
+                self.gen_opts["reasoning_effort"] = chosen
+                if chosen != "auto":
+                    self.show_thinking = True
+                self.save_cfg()
+                self.add_log(3, f"● Уровень усилий установлен: {chosen.upper()}")
+                return
+
+    def toggle_thinking(self):
+        self.show_thinking = not self.show_thinking
+        self.save_cfg()
+        self.add_log(3, f"● Показ мыслей модели: {'ВКЛ' if self.show_thinking else 'ВЫКЛ'}")
+
+    def render_thinking_body(self, text):
+        if not text or not self.show_thinking:
+            return
+        self.add_log(7, "  ┌─ 💭 Мысли модели ───────────────────")
+        for line in text.splitlines():
+            self.add_log(8, f"  │ {line}")
+        self.add_log(7, "  └─────────────────────────────────────")
+
+    def toggle_quote_run(self):
+        self.run_in_quotes = not self.run_in_quotes
+        st = "ВКЛ (с авто-штрафом модели)" if self.run_in_quotes else "ВЫКЛ"
+        self.add_log(3, f"● Выполнение //run в цитатах: {st}")
+
+    def toggle_mouse(self):
+        self.mouse_on = not self.mouse_on
+        curses.mousemask((curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION) if self.mouse_on else 0)
+        self.add_log(3, f"● Мышь: {'Прокрутка колесом (выделение с Shift)' if self.mouse_on else 'Свободное выделение мышкой'}")
+
+    def copy_last_reply(self):
+        last_ai = next((m["content"] for m in reversed(self.msgs) if m["role"] == "assistant" and "//run ls -la" not in m["content"]), "")
+        if not last_ai:
+            self.add_log(3, "● Нет ответа ИИ для копирования")
+            return
+        (BASE_DIR / "last_reply.txt").write_text(last_ai, encoding="utf-8")
+        copied = False
+        for cmd in (["wl-copy"], ["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"]):
+            if shutil.which(cmd):
+                try:
+                    subprocess.run(cmd, input=last_ai, text=True, check=True, timeout=3)
+                    copied = True
+                    break
+                except Exception:
+                    pass
+        if copied:
+            self.add_log(2, f"● Ответ ИИ скопирован в буфер обмена ({len(last_ai)} симв.)")
+        else:
+            self.add_log(3, f"● Сохранено в {BASE_DIR / 'last_reply.txt'}")
+
+    def add_log(self, color, text):
+        for line in text.splitlines() or [""]:
+            self.log.append((color, line))
+        self.scroll = 0
+
+    def render_ai_body(self, text):
+        in_code = False
+        for line in text.splitlines():
+            s = line.strip()
+            if s.startswith("```"):
+                if not in_code:
+                    in_code = True
+                    lbl = f" {s[3:].strip()} " if s[3:].strip() else " КОД "
+                    self.add_log(7, f"  ┌─{lbl}" + "─" * max(4, 38 - len(lbl)))
+                else:
+                    in_code = False
+                    self.add_log(7, "  └" + "─" * 40)
+            elif in_code:
+                self.add_log(7, f"  │ {line}")
+            else:
+                self.add_log(8, f"  {line}")
+        if in_code:
+            self.add_log(7, "  └" + "─" * 40)
+
+    def render_ai_footer(self, status_suffix=""):
+        mode_lbl = "Build" if self.mode == "BUILD" else "Plan"
+        sq_color = 12 if self.mode == "BUILD" else 3
+        m_name = self.model_short()
+        extra = f" · {status_suffix}" if status_suffix else ""
+        self.add_log(sq_color, f"  ▣ {mode_lbl} · {m_name} · {self.provider_label()} [{self.model_flag()}]{extra}")
+        self.add_log(8, "")
+
+    def toggle_mode(self):
+        self.mode = "PLAN" if self.mode == "BUILD" else "BUILD"
+        self.msgs = init_msgs(self.mode)
+        self.add_log(3, f"● Режим переключён: {self.mode.capitalize()}")
+
+    def toggle_sec(self):
+        self.sec_idx = (self.sec_idx + 1) % len(SEC_MODES)
+        self.add_log(3, f"● Защита: {self.sec} ({SEC_LABELS[self.sec]})")
+
+    def toggle_ctx(self):
+        self.ctx_idx = (self.ctx_idx + 1) % len(CTX_MODES)
+        self.add_log(3, f"● Контекст: {self.ctx_mode}")
+
+    def cycle_preset(self):
+        keys = list(PRESETS.keys())
+        nxt = keys[(keys.index(self.preset_name) + 1) % len(keys)] if self.preset_name in keys else "BALANCED"
+        self.preset_name = nxt
+        self.gen_opts = dict(PRESETS[nxt])
+        self.save_cfg()
+        self.add_log(3, f"● Пресет: {nxt} (t={self.gen_opts['temperature']}, top_p={self.gen_opts['top_p']}, top_k={self.gen_opts['top_k']})")
+
+    def get_key_blocking(self):
+        self.stdscr.timeout(-1)
+        try:
+            return self.stdscr.get_wch()
+        finally:
+            self.stdscr.timeout(80)
+
+    def prompt_number(self, title, cur_val, is_int=False):
+        val_str = str(cur_val)
+        while True:
+            self.draw()
+            my, mx = self.stdscr.getmaxyx()
+            w, h = min(50, mx - 4), 5
+            y0, x0 = max(1, (my - h) // 2), max(2, (mx - w) // 2)
+            for dy in range(h):
+                try:
+                    self.stdscr.addstr(y0 + dy, x0, " " * w, curses.color_pair(9))
+                except curses.error:
+                    pass
+            try:
+                self.stdscr.addstr(y0 + 1, x0 + 2, title[:w - 4], curses.color_pair(9) | curses.A_BOLD)
+                self.stdscr.addstr(y0 + 2, x0 + 2, f"Значение: {val_str}_"[:w - 4], curses.color_pair(6))
+                self.stdscr.addstr(y0 + 3, x0 + 2, "[Enter] Сохранить   [Esc] Отмена"[:w - 4], curses.color_pair(9) | curses.A_DIM)
+            except curses.error:
+                pass
+            self.stdscr.refresh()
+            ch = self.get_key_blocking()
+            if ch == "\x1b":
+                return None
+            elif ch in ("\n", "\r", curses.KEY_ENTER):
+                try:
+                    return int(val_str) if is_int else round(float(val_str), 3)
+                except ValueError:
+                    return None
+            elif ch in (curses.KEY_BACKSPACE, "\b", "\x7f"):
+                val_str = val_str[:-1]
+            elif isinstance(ch, str) and (ch.isdigit() or (ch == "." and not is_int and "." not in val_str)):
+                val_str += ch
+
+    def run_pull_process(self, pull_target):
+        cmd = pull_target if pull_target.startswith("ollama pull ") else f"ollama pull {pull_target}"
+        model_name = cmd.replace("ollama pull ", "").strip()
+        self.add_log(3, f"● Скачивание модели: {cmd}")
+        self.is_busy = True
+        self.status = f"Загрузка {model_name[:18]}..."
+        self.draw()
+        try:
+            proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+            last_line = ""
+            for raw in proc.stdout:
+                clean = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", raw).strip()
+                if clean and clean != last_line:
+                    last_line = clean
+                    self.status = clean[:28]
+                    self.draw()
+            proc.wait()
+            if proc.returncode == 0:
+                self.models = [m["ref"] for m in provider_models(self.cfg, discover=False)]
+                ref = f"ollama/{model_name}" if "ollama" in self.cfg.get("providers", {}) else model_name
+                self.model = ref
+                save_model_choice(ref)
+                self.add_log(2, f"● Модель {model_name} успешно скачана и выбрана!\n")
+            else:
+                self.add_log(4, f"● Ошибка скачивания (код {proc.returncode}): {last_line}\n")
+        except Exception as e:
+            self.add_log(4, f"● Ошибка запуска pull: {e}\n")
+        self.is_busy = False
+        self.status = "Готов"
+
+    def open_model_selector(self):
+        entries = provider_models(self.cfg)
+        self.models = [m["ref"] for m in entries]
+        query, sel = "", 0
+        cur = self.model
+        while True:
+            filtered = [m for m in entries if query.lower() in (m["ref"] + " " + m["provider_name"]).lower()]
+            items = []
+            for m in filtered:
+                flags = "локально" if m["local"] else ("free" if m["free"] else "cloud")
+                if not m["ready"]:
+                    flags += " · ключ"
+                tag = f"{m['provider_name'][:16]} [{flags}]"
+                items.append((m["model"], tag, "model", m["ref"]))
+            items.append(("Скачать модель в Ollama (Ollama / HuggingFace)...", "ctrl+d", "download", None))
+            sel = max(0, min(sel, len(items) - 1))
+
+            self.draw()
+            my, mx = self.stdscr.getmaxyx()
+            w = min(78, mx - 4)
+            h = min(len(items) + 8, my - 2)
+            y0, x0 = max(1, (my - h) // 2), max(2, (mx - w) // 2)
+            for dy in range(h):
+                try:
+                    self.stdscr.addstr(y0 + dy, x0, " " * w, curses.color_pair(9))
+                except curses.error:
+                    pass
+            try:
+                self.stdscr.addstr(y0 + 1, x0 + 2, "Выбор модели · любой провайдер", curses.color_pair(9) | curses.A_BOLD)
+                self.stdscr.addstr(y0 + 1, x0 + w - 5, "esc", curses.color_pair(9) | curses.A_DIM)
+                s_disp = f"Поиск: {query}_" if query else "Поиск (начните печатать)"
+                self.stdscr.addstr(y0 + 3, x0 + 2, s_disp[:w - 4], curses.color_pair(9) | (0 if query else curses.A_DIM))
+                head = f"Моделей: {len(entries)}   сейчас: {self.model_short()}"
+                self.stdscr.addstr(y0 + 4, x0 + 2, head[:w - 4], curses.color_pair(11) | curses.A_BOLD)
+
+                max_rows = max(4, h - 6)
+                vis_cap = max(2, max_rows - 3)
+                start_row = max(0, sel - vis_cap + 1)
+                for row_i in range(max_rows):
+                    idx = start_row + row_i
+                    if idx >= len(items):
+                        break
+                    title, tag, _, val = items[idx]
+                    mark = "● " if val == cur else "  "
+                    left_txt = f"{mark}{title}"
+                    inner_w = w - 4
+                    tag_disp = tag[-28:]
+                    body = left_txt[:inner_w - len(tag_disp) - 1].ljust(inner_w - len(tag_disp)) + tag_disp
+                    attr = (curses.color_pair(6) | curses.A_BOLD) if idx == sel else curses.color_pair(9)
+                    self.stdscr.addstr(y0 + 5 + row_i, x0 + 2, body[:inner_w], attr)
+            except curses.error:
+                pass
+            self.stdscr.refresh()
+
+            ch = self.get_key_blocking()
+            if ch == "\x1b":
+                return
+            elif ch == "\x04":
+                self.open_download_modal()
+                return
+            elif ch == curses.KEY_UP:
+                sel = (sel - 1) % len(items)
+            elif ch == curses.KEY_DOWN:
+                sel = (sel + 1) % len(items)
+            elif ch in (curses.KEY_BACKSPACE, "\b", "\x7f"):
+                query = query[:-1]
+            elif ch in ("\n", "\r", curses.KEY_ENTER):
+                _, _, act, val = items[sel]
+                if act == "model":
+                    self.model = val
+                    cur = val
+                    save_model_choice(val)
+                    self.add_log(3, f"● Выбрана модель: {self.model_short()} · {self.provider_label()} [{self.model_flag()}]")
+                elif act == "download":
+                    self.open_download_modal()
+                return
+            elif isinstance(ch, str) and ch.isprintable():
+                query += ch
+
+    def open_session_selector(self):
+        sessions = sorted(SESS_DIR.glob("session_*.json"), reverse=True)[:15]
+        parsed = []
+        for sp in sessions:
+            try:
+                d = json.loads(sp.read_text(encoding="utf-8"))
+                parsed.append((d.get("title") or f"Сессия {d.get('id', '')[-6:]}", d.get("id", ""), str(sp)))
+            except Exception:
+                pass
+        query, sel = "", 0
+        while True:
+            items = [p for p in parsed if query.lower() in f"{p} {p}".lower()]
+            if not items:
+                items = [("Нет сохранённых сессий", "", None)]
+            sel = max(0, min(sel, len(items) - 1))
+
+            self.draw()
+            my, mx = self.stdscr.getmaxyx()
+            w = min(68, mx - 4)
+            h = min(len(items) + 8, my - 2)
+            y0, x0 = max(1, (my - h) // 2), max(2, (mx - w) // 2)
+            for dy in range(h):
+                try:
+                    self.stdscr.addstr(y0 + dy, x0, " " * w, curses.color_pair(9))
+                except curses.error:
+                    pass
+            try:
+                self.stdscr.addstr(y0 + 1, x0 + 2, "Сессии", curses.color_pair(9) | curses.A_BOLD)
+                self.stdscr.addstr(y0 + 1, x0 + w - 5, "esc", curses.color_pair(9) | curses.A_DIM)
+                s_disp = f"Поиск: {query}_" if query else "Поиск"
+                self.stdscr.addstr(y0 + 3, x0 + 2, s_disp[:w - 4], curses.color_pair(9) | (0 if query else curses.A_DIM))
+                self.stdscr.addstr(y0 + 4, x0 + 2, "Недавние", curses.color_pair(11) | curses.A_BOLD)
+
+                max_rows = h - 7
+                start_row = max(0, sel - max_rows + 1)
+                for row_i in range(max_rows):
+                    idx = start_row + row_i
+                    if idx >= len(items):
+                        break
+                    title, sid, _ = items[idx]
+                    inner_w = w - 4
+                    body = title[:inner_w - len(sid) - 2].ljust(inner_w - len(sid)) + sid
+                    attr = (curses.color_pair(6) | curses.A_BOLD) if idx == sel else curses.color_pair(9)
+                    self.stdscr.addstr(y0 + 5 + row_i, x0 + 2, body[:inner_w], attr)
+                self.stdscr.addstr(y0 + h - 2, x0 + 2, "удалить ctrl+d   новая сессия ctrl+n"[:w - 4], curses.color_pair(9) | curses.A_DIM)
+            except curses.error:
+                pass
+            self.stdscr.refresh()
+
+            ch = self.get_key_blocking()
+            if ch == "\x1b":
+                return
+            elif ch == "\x0e":
+                self.new_session()
+                return
+            elif ch == "\x04" and items[sel][2]:
+                try:
+                    Path(items[sel][2]).unlink(missing_ok=True)
+                    parsed = [p for p in parsed if p != items[sel]]
+                except Exception:
+                    pass
+            elif ch == curses.KEY_UP:
+                sel = (sel - 1) % len(items)
+            elif ch == curses.KEY_DOWN:
+                sel = (sel + 1) % len(items)
+            elif ch in (curses.KEY_BACKSPACE, "\b", "\x7f"):
+                query = query[:-1]
+            elif ch in ("\n", "\r", curses.KEY_ENTER):
+                if items[sel][2]:
+                    self.load_session(items[sel][2])
+                return
+            elif isinstance(ch, str) and ch.isprintable():
+                query += ch
+
+    def open_download_modal(self):
+        tab = 0
+        inp = ""
+        hf_results = []
+        hf_sel = 0
+        hf_status = "Введите запрос (напр. qwen coder) и нажмите Enter"
+
+        while True:
+            self.draw()
+            my, mx = self.stdscr.getmaxyx()
+            w = min(72, mx - 4)
+            h = min(16, my - 2)
+            y0, x0 = max(1, (my - h) // 2), max(2, (mx - w) // 2)
+
+            for dy in range(h):
+                try:
+                    self.stdscr.addstr(y0 + dy, x0, " " * w, curses.color_pair(9))
+                except curses.error:
+                    pass
+
+            try:
+                self.stdscr.addstr(y0 + 1, x0 + 2, "Загрузка модели", curses.color_pair(9) | curses.A_BOLD)
+                self.stdscr.addstr(y0 + 1, x0 + w - 5, "esc", curses.color_pair(9) | curses.A_DIM)
+
+                t1_attr = (curses.color_pair(6) | curses.A_BOLD) if tab == 0 else (curses.color_pair(9) | curses.A_DIM)
+                t2_attr = (curses.color_pair(6) | curses.A_BOLD) if tab == 1 else (curses.color_pair(9) | curses.A_DIM)
+                self.stdscr.addstr(y0 + 3, x0 + 2, " 1. Ollama Pull ", t1_attr)
+                self.stdscr.addstr(y0 + 3, x0 + 20, " 2. Hugging Face (GGUF) ", t2_attr)
+                self.stdscr.addstr(y0 + 3, x0 + w - 18, "[←/→ Tab] вкладка", curses.color_pair(9) | curses.A_DIM)
+
+                lbl = "Команда / тег:" if tab == 0 else "Поиск на HF:"
+                self.stdscr.addstr(y0 + 5, x0 + 2, f"{lbl} {inp}_"[:w - 4], curses.color_pair(10 if tab == 0 else 11) | curses.A_BOLD)
+
+                if tab == 0:
+                    hints = [
+                        "Примеры для ввода:",
+                        "  qwen2.5-coder:3b      (быстрая для кода, ~1.9 ГБ)",
+                        "  qwen3.5:4b            (умная универсальная, ~2.7 ГБ)",
+                        "  llama3.2:3b           (лёгкая модель от Meta)",
+                        "Нажмите [Enter] для начала скачивания.",
+                    ]
+                    for idx, hl in enumerate(hints):
+                        if 7 + idx < h - 1:
+                            self.stdscr.addstr(y0 + 7 + idx, x0 + 2, hl[:w - 4], curses.color_pair(9) | curses.A_DIM)
+                else:
+                    self.stdscr.addstr(y0 + 6, x0 + 2, hf_status[:w - 4], curses.color_pair(11))
+                    max_r = h - 9
+                    start_r = max(0, hf_sel - max_r + 1)
+                    for r_i in range(max_r):
+                        idx = start_r + r_i
+                        if idx >= len(hf_results):
+                            break
+                        repo_id, dls = hf_results[idx]
+                        row_txt = f"hf.co/{repo_id}".ljust(w - 14)[:w - 14] + f" ↓{dls}"
+                        attr = (curses.color_pair(6) | curses.A_BOLD) if idx == hf_sel else curses.color_pair(9)
+                        self.stdscr.addstr(y0 + 8 + r_i, x0 + 2, row_txt[:w - 4], attr)
+            except curses.error:
+                pass
+            self.stdscr.refresh()
+
+            ch = self.get_key_blocking()
+            if ch in ("\x1b", "\x04"):
+                return
+            elif ch in ("\t", curses.KEY_LEFT, curses.KEY_RIGHT):
+                tab = 1 - tab
+                inp = ""
+            elif ch == curses.KEY_UP and tab == 1 and hf_results:
+                hf_sel = (hf_sel - 1) % len(hf_results)
+            elif ch == curses.KEY_DOWN and tab == 1 and hf_results:
+                hf_sel = (hf_sel + 1) % len(hf_results)
+            elif ch in (curses.KEY_BACKSPACE, "\b", "\x7f"):
+                inp = inp[:-1]
+            elif ch in ("\n", "\r", curses.KEY_ENTER):
+                if tab == 0 and inp.strip():
+                    self.run_pull_process(inp.strip())
+                    return
+                elif tab == 1:
+                    if hf_results and not inp.strip():
+                        repo_id, _ = hf_results[hf_sel]
+                        self.run_pull_process(f"hf.co/{repo_id}")
+                        return
+                    elif inp.strip():
+                        hf_status = "Поиск на Hugging Face..."
+                        self.draw()
+                        try:
+                            hf_results = search_hf_gguf(inp.strip())
+                            hf_sel = 0
+                            inp = ""
+                            hf_status = f"Найдено: {len(hf_results)} (↑/↓ выбор, Enter — скачать в Ollama)" if hf_results else "Ничего не найдено"
+                        except Exception as e:
+                            hf_status = f"Ошибка поиска HF: {str(e)[:40]}"
+            elif isinstance(ch, str) and ch.isprintable():
+                inp += ch
+
+    def open_palette(self):
+        query, sel = "", 0
+        while True:
+            all_items = [
+                ("Рекомендуемые", "Переключить сессию", "ctrl+x l", "sessions", None),
+                ("Рекомендуемые", f"Выбрать модель ({self.model_short()} · {self.provider_label()})", "ctrl+x m", "model", None),
+                ("Рекомендуемые", "Новая сессия", "ctrl+x n", "new", None),
+                ("Рекомендуемые", "Скачать модель (Ollama / HuggingFace)", "ctrl+d", "download", None),
+                ("Рекомендуемые", "Скопировать последний ответ ИИ", "ctrl+y", "copy", None),
+                ("Рекомендуемые", "Настроить провайдера / API-ключи (auth)", "", "auth", None),
+                ("Генерация", f"Показ мыслей модели ({'ВКЛ' if self.show_thinking else 'ВЫКЛ'})", "", "thinking", None),
+                ("Генерация", f"Пресет: {self.preset_name} (CODE / BALANCED / CREATIVE)", "f4", "preset", None),
+                ("Генерация", f"Температура (Temperature): {self.gen_opts['temperature']}", "", "temp", None),
+                ("Генерация", f"Top-P: {self.gen_opts['top_p']}", "", "top_p", None),
+                ("Генерация", f"Top-K: {self.gen_opts['top_k']}", "", "top_k", None),
+                ("Генерация", f"Штраф за повторы (Repeat Penalty): {self.gen_opts['repeat_penalty']}", "", "rep", None),
+                ("Система", f"Переключить режим агента ({self.mode.capitalize()})", "tab", "mode", None),
+                ("Система", f"Уровень безопасности ({self.sec})", "f2", "sec", None),
+                ("Система", f"Режим контекста ({self.ctx_mode})", "f3", "ctx", None),
+                ("Система", f"Выполнять //run в цитатах ({'ВКЛ' if self.run_in_quotes else 'ВЫКЛ'})", "f6", "quote_run", None),
+                ("Система", f"Режим мыши ({'Прокрутка' if self.mouse_on else 'Выделение'})", "f5", "mouse", None),
+                ("Система", "Показать / скрыть боковую панель", "ctrl+b", "sidebar", None),
+                ("Система", "Обновить список моделей (все провайдеры)", "", "refresh", None),
+            ]
+
+            items = [it for it in all_items if query.lower() in f"{it} {it}".lower()]
+            if not items:
+                items = [("Система", "Ничего не найдено", "", "none", None)]
+            sel = max(0, min(sel, len(items) - 1))
+
+            self.draw()
+            my, mx = self.stdscr.getmaxyx()
+            w = min(68, mx - 4)
+            h = min(len(items) + 7, my - 2)
+            y0, x0 = max(1, (my - h) // 2), max(2, (mx - w) // 2)
+            for dy in range(h):
+                try:
+                    self.stdscr.addstr(y0 + dy, x0, " " * w, curses.color_pair(9))
+                except curses.error:
+                    pass
+            try:
+                self.stdscr.addstr(y0 + 1, x0 + 2, "Команды", curses.color_pair(9) | curses.A_BOLD)
+                self.stdscr.addstr(y0 + 1, x0 + w - 5, "esc", curses.color_pair(9) | curses.A_DIM)
+                s_disp = f"Поиск: {query}_" if query else "Поиск"
+                self.stdscr.addstr(y0 + 3, x0 + 2, s_disp[:w - 4], curses.color_pair(9) | (0 if query else curses.A_DIM))
+                max_rows = h - 6
+                start_row = max(0, sel - max_rows + 1)
+                last_cat = None
+                row_cursor = 0
+                for idx in range(start_row, len(items)):
+                    if row_cursor >= max_rows:
+                        break
+                    cat, title, hk, _, _ = items[idx]
+                    if cat != last_cat and row_cursor < max_rows - 1:
+                        self.stdscr.addstr(y0 + 5 + row_cursor, x0 + 2, cat, curses.color_pair(11) | curses.A_BOLD)
+                        last_cat = cat
+                        row_cursor += 1
+                    inner_w = w - 4
+                    body = f"  {title}"[:inner_w - len(hk) - 1].ljust(inner_w - len(hk)) + hk
+                    attr = (curses.color_pair(6) | curses.A_BOLD) if idx == sel else curses.color_pair(9)
+                    self.stdscr.addstr(y0 + 5 + row_cursor, x0 + 2, body[:inner_w], attr)
+                    row_cursor += 1
+            except curses.error:
+                pass
+            self.stdscr.refresh()
+            ch = self.get_key_blocking()
+            if ch in ("\x1b", "\x10"):
+                return
+            elif ch == curses.KEY_UP:
+                sel = (sel - 1) % len(items)
+            elif ch == curses.KEY_DOWN:
+                sel = (sel + 1) % len(items)
+            elif ch in (curses.KEY_BACKSPACE, "\b", "\x7f"):
+                query = query[:-1]
+            elif ch in ("\n", "\r", curses.KEY_ENTER):
+                _, _, _, act, _ = items[sel]
+                if act == "new":
+                    self.new_session()
+                elif act == "sessions":
+                    self.open_session_selector()
+                elif act == "model":
+                    self.open_model_selector()
+                elif act == "copy":
+                    self.copy_last_reply()
+                elif act == "quote_run":
+                    self.toggle_quote_run()
+                elif act == "mouse":
+                    self.toggle_mouse()
+                elif act == "sidebar":
+                    self.show_sidebar = not self.show_sidebar
+                elif act == "thinking":
+                    self.toggle_thinking()
+                elif act == "stream":
+                    self.toggle_stream()
+                elif act == "thinking":
+                    self.toggle_thinking()
+                elif act == "effort":
+                    self.open_effort_selector()
+                elif act == "preset":
+                    self.cycle_preset()
+                elif act == "temp":
+                    v = self.prompt_number("Temperature (0.0 - 1.5)", self.gen_opts["temperature"], False)
+                    if v is not None:
+                        self.gen_opts["temperature"] = v
+                        self.preset_name = "CUSTOM"
+                        self.save_cfg()
+                elif act == "top_p":
+                    v = self.prompt_number("Top-P (0.1 - 1.0)", self.gen_opts["top_p"], False)
+                    if v is not None:
+                        self.gen_opts["top_p"] = v
+                        self.preset_name = "CUSTOM"
+                        self.save_cfg()
+                elif act == "top_k":
+                    v = self.prompt_number("Top-K (1 - 100)", self.gen_opts["top_k"], True)
+                    if v is not None:
+                        self.gen_opts["top_k"] = v
+                        self.preset_name = "CUSTOM"
+                        self.save_cfg()
+                elif act == "rep":
+                    v = self.prompt_number("Repeat Penalty (1.0 - 1.5)", self.gen_opts["repeat_penalty"], False)
+                    if v is not None:
+                        self.gen_opts["repeat_penalty"] = v
+                        self.preset_name = "CUSTOM"
+                        self.save_cfg()
+                elif act == "ctx":
+                    self.toggle_ctx()
+                elif act == "mode":
+                    self.toggle_mode()
+                elif act == "sec":
+                    self.toggle_sec()
+                elif act == "auth":
+                    curses.def_prog_mode()
+                    curses.endwin()
+                    try:
+                        cmd_auth()
+                        self.cfg = load_config()
+                    finally:
+                        curses.reset_prog_mode()
+                        self.stdscr.refresh()
+                    if not self.model:
+                        self.model = choose_start_model(self.cfg)
+                        save_model_choice(self.model)
+                    self.add_log(3, "● Настройки провайдеров обновлены")
+                elif act == "refresh":
+                    self.cfg = load_config()
+                    self.models = [m["ref"] for m in provider_models(self.cfg)]
+                    if self.models and not self.model:
+                        self.model = choose_start_model(self.cfg)
+                        save_model_choice(self.model)
+                    self.add_log(3, f"● Найдено моделей: {len(self.models)}")
+                elif act == "download":
+                    self.open_download_modal()
+                return
+            elif isinstance(ch, str) and ch.isprintable():
+                query += ch
+
+    def get_sys_metrics(self):
+        now = time.time()
+        if now - self._sys_cache[0] < 1.5 and self._sys_cache[1]:
+            return self._sys_cache[1]
+        # CPU % из /proc/stat
+        cpu_pct = 0.0
+        try:
+            with open("/proc/stat") as f:
+                parts = [float(x) for x in f.readline().split()[1:8]]
+            idle, total = parts[3] + parts[4], sum(parts)
+            prev = getattr(self, "_prev_cpu", None)
+            if prev and total > prev[1]:
+                cpu_pct = max(0.0, min(100.0, (1.0 - (idle - prev[0]) / (total - prev[1])) * 100.0))
+            self._prev_cpu = (idle, total)
+        except Exception:
+            pass
+        # ОЗУ ГБ / ГБ из /proc/meminfo
+        ram_str = "ОЗУ: н/д"
+        try:
+            mi = {}
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    k, v = line.split(":", 1)
+                    mi[k] = int(v.strip().split()[0])
+            tot_gb = mi["MemTotal"] / 1048576
+            used_gb = (mi["MemTotal"] - mi.get("MemAvailable", mi.get("MemFree", 0))) / 1048576
+            ram_str = f"ОЗУ: {used_gb:.1f}/{tot_gb:.1f} ГБ"
+        except Exception:
+            pass
+        # Диск ГБ / ГБ
+        try:
+            du = shutil.disk_usage(os.path.expanduser("~"))
+            disk_str = f"Диск: {du.used / (1024**3):.0f}/{du.total / (1024**3):.0f} ГБ"
+        except Exception:
+            disk_str = "Диск: н/д"
+        # Сеть (проверка активного маршрута в /proc/net/route)
+        online = False
+        try:
+            with open("/proc/net/route") as f:
+                for line in f.readlines()[1:]:
+                    cols = line.split()
+                    if len(cols) > 3 and cols[1] == "00000000" and (int(cols[3], 16) & 2):
+                        online = True
+                        break
+        except Exception:
+            pass
+        res = [
+            (f"ЦП: {cpu_pct:4.1f}%", curses.color_pair(2 if cpu_pct < 75 else 4)),
+            (ram_str, curses.color_pair(1)),
+            (disk_str, curses.color_pair(8) | curses.A_DIM),
+            ("Сеть: онлайн" if online else "Сеть: офлайн", curses.color_pair(2 if online else 4)),
+        ]
+        self._sys_cache = (now, res)
+        return res
+
+    def draw_busy_indicator(self, y, x):
+        frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        spin = frames[self.anim_tick % len(frames)]
+        dots = "." * ((self.anim_tick // 3) % 4)
+        self.anim_tick += 1
+        phase = getattr(self, "gen_phase", "wait")
+        elapsed = time.time() - getattr(self, "think_start", time.time())
+        if phase == "think":
+            lbl = f"{spin} thinking{dots:<3} {elapsed:4.1f}с"
+            attr = curses.color_pair(2) | curses.A_BOLD
+        elif phase == "text":
+            lbl = f"{spin} ответ{dots:<3}"
+            attr = curses.color_pair(1) | curses.A_BOLD
+        else:
+            lbl = f"{spin} ожидание{dots:<3}"
+            attr = curses.color_pair(3) | curses.A_DIM
+        try:
+            self.stdscr.addstr(y, x, lbl, attr)
+            nx = x + len(lbl) + 2
+            self.stdscr.addstr(y, nx, "esc", curses.color_pair(8) | curses.A_BOLD)
+            esc_hint = "ещё раз! " if (time.time() - getattr(self, "last_esc_time", 0) < 1.2) else "прервать "
+            self.stdscr.addstr(y, nx + 4, f"{esc_hint}· {self.status}", curses.color_pair(3 if "ещё" in esc_hint else 8) | curses.A_DIM)
+        except curses.error:
+            pass
+
+    def draw(self):
+        self.stdscr.erase()
+        my, mx = self.stdscr.getmaxyx()
+        if my < 10 or mx < 45:
+            try:
+                self.stdscr.addstr(0, 0, "Увеличьте окно терминала")
+            except curses.error:
+                pass
+            self.stdscr.refresh()
+            return
+
+        card_accent = 10 if self.mode == "BUILD" else 11
+        sc = 3 if self.sec == "ASK ALL" else (2 if self.sec == "SAFE AUTO" else 4)
+        cwd_short = os.getcwd().replace(os.path.expanduser("~"), "~")
+        model_label = self.model_short() if self.model else "НЕТ МОДЕЛИ (нажмите ctrl+d)"
+
+        if not self.log:
+            bw = min(70, mx - 6)
+            bx = max(2, (mx - bw) // 2)
+            cy = max(2, (my - 11) // 2)
+            for idx, l_line in enumerate(LOGO):
+                try:
+                    self.stdscr.addstr(cy + idx, max(1, (mx - len(l_line)) // 2), l_line[:mx - 2], curses.color_pair(8) | curses.A_BOLD)
+                except curses.error:
+                    pass
+            try:
+                sub = "Локальный ИИ-агент для терминала и кода"
+                self.stdscr.addstr(cy + 3, max(1, (mx - len(sub)) // 2), sub[:mx - 2], curses.color_pair(8) | curses.A_DIM)
+                for r_i in range(4):
+                    self.stdscr.addstr(cy + 5 + r_i, bx, " " * bw, curses.color_pair(9))
+                self.stdscr.addstr(cy + 5, bx, "┃", curses.color_pair(card_accent) | curses.A_BOLD)
+                self.stdscr.addstr(cy + 6, bx, "┃ ", curses.color_pair(card_accent) | curses.A_BOLD)
+                prompt = "Спросите что угодно... " if not self.buf else "Вы > "
+                shown = self.buf[-(bw - 8):] if self.buf else ""
+                if not self.buf:
+                    self.stdscr.addstr(prompt, curses.color_pair(9) | curses.A_DIM)
+                else:
+                    self.stdscr.addstr(prompt, curses.color_pair(9) | curses.A_BOLD)
+                    self.stdscr.addstr(shown, curses.color_pair(9))
+                self.stdscr.addstr(cy + 7, bx, "┃ ", curses.color_pair(card_accent) | curses.A_BOLD)
+                self.stdscr.addstr(self.mode.capitalize(), curses.color_pair(card_accent) | curses.A_BOLD)
+                self.stdscr.addstr(f" · {model_label} · {self.provider_label()} [{self.model_flag()}]", curses.color_pair(9) | curses.A_DIM)
+                self.stdscr.addstr(cy + 8, bx, "┃", curses.color_pair(card_accent) | curses.A_BOLD)
+                q_lbl = "● //run в цитатах"
+                q_attr = (curses.color_pair(2) | curses.A_BOLD) if self.run_in_quotes else (curses.color_pair(8) | curses.A_DIM)
+                self.stdscr.addstr(cy + 10, bx, q_lbl[:bw // 2], q_attr)
+                hints = "tab режимы   ctrl+p команды"
+                self.stdscr.addstr(cy + 10, bx + max(0, bw - len(hints)), hints[:bw], curses.color_pair(8) | curses.A_DIM)
+                tip_prefix = "● Совет "
+                full_tip = tip_prefix + self.tip
+                tx = max(1, (mx - len(full_tip)) // 2)
+                self.stdscr.addstr(cy + 12, tx, tip_prefix, curses.color_pair(3) | curses.A_BOLD)
+                self.stdscr.addstr(self.tip[:max(0, mx - tx - len(tip_prefix) - 1)], curses.color_pair(8) | curses.A_DIM)
+                self.stdscr.addstr(my - 1, 1, cwd_short[:mx - 18], curses.color_pair(8) | curses.A_DIM)
+                self.stdscr.addstr(my - 1, max(1, mx - 16), "SuperCode 2.1", curses.color_pair(8) | curses.A_DIM)
+                self.stdscr.move(cy + 6, min(mx - 2, bx + 2 + (0 if not self.buf else len(prompt) + len(shown))))
+            except curses.error:
+                pass
+            self.stdscr.refresh()
+            return
+        side_w = 30 if (mx >= 86 and self.show_sidebar) else 0
+        main_w = mx - side_w - (1 if side_w else 0)
+        chat_h = my - 6
+        wrapped = [
+            (c, w)
+            for c, r in self.log
+            for w in (textwrap.wrap(r, width=main_w - 4, replace_whitespace=False) or [""] if r else [""])
+        ]
+        self.scroll = min(self.scroll, max(0, len(wrapped) - chat_h))
+        end = len(wrapped) - self.scroll
+
+        for i, (c, line) in enumerate(wrapped[max(0, end - chat_h):end]):
+            try:
+                if c == 9:
+                    self.stdscr.addstr(i, 2, " " * (main_w - 4), curses.color_pair(9))
+                    self.stdscr.addstr(i, 2, "┃", curses.color_pair(card_accent) | curses.A_BOLD)
+                    self.stdscr.addstr(i, 3, line[1:main_w - 4], curses.color_pair(9))
+                elif c == 12:
+                    self.stdscr.addstr(i, 1, line[:main_w - 2], curses.color_pair(12) | curses.A_BOLD)
+                else:
+                    self.stdscr.addstr(i, 1, line[:main_w - 2], curses.color_pair(c) | (curses.A_BOLD if c in (5, 7) else 0))
+            except curses.error:
+                pass
+
+        if side_w:
+            sx = main_w + 1
+            for y in range(my - 1):
+                try:
+                    self.stdscr.addstr(y, main_w, "│", curses.color_pair(8) | curses.A_DIM)
+                except curses.error:
+                    pass
+            tok = self.est_tokens()
+            pct = min(100, int(tok * 100 / 4096))
+            side_info = [
+                (self.sess_title[:side_w - 3], curses.color_pair(8) | curses.A_BOLD),
+                ("", 0),
+                ("Контекст", curses.color_pair(8) | curses.A_BOLD),
+                (f"{tok} токенов", curses.color_pair(8) | curses.A_DIM),
+                (f"{pct}% занято · $0.00", curses.color_pair(8) | curses.A_DIM),
+                (f"{self.ctx_mode} · SSD: {self.offloaded_count}", curses.color_pair(1)),
+                ("", 0),
+                ("Генерация", curses.color_pair(8) | curses.A_BOLD),
+                (f"Пресет: {self.preset_name}", curses.color_pair(2)),
+                (f"temp:{self.gen_opts['temperature']} top_p:{self.gen_opts['top_p']}", curses.color_pair(8) | curses.A_DIM),
+                (f"top_k:{self.gen_opts['top_k']} rep:{self.gen_opts['repeat_penalty']}", curses.color_pair(8) | curses.A_DIM),
+                ("", 0),
+                ("Агент и защита", curses.color_pair(8) | curses.A_BOLD),
+                (f"Режим: {self.mode.capitalize()}", curses.color_pair(12 if self.mode == "BUILD" else 3)),
+                (f"Защита: {self.sec}", curses.color_pair(sc)),
+                (self.status[:side_w - 3], curses.color_pair(3)),
+            ]
+            for idx, (stext, sattr) in enumerate(side_info):
+                if idx < my - 8:
+                    try:
+                        self.stdscr.addstr(1 + idx, sx + 1, stext[:side_w - 2], sattr)
+                    except curses.error:
+                        pass
+            sys_rows = self.get_sys_metrics()
+            sep_y = my - 7
+            if sep_y > len(side_info) + 1:
+                try:
+                    self.stdscr.addstr(sep_y, sx + 1, "─" * (side_w - 3), curses.color_pair(8) | curses.A_DIM)
+                    for r_i, (r_txt, r_attr) in enumerate(sys_rows):
+                        self.stdscr.addstr(sep_y + 1 + r_i, sx + 1, r_txt[:side_w - 2], r_attr)
+                except curses.error:
+                    pass
+
+        box_w = main_w - 4
+        try:
+            for r_i in range(4):
+                self.stdscr.addstr(my - 5 + r_i, 2, " " * box_w, curses.color_pair(9))
+            self.stdscr.addstr(my - 5, 2, "┃", curses.color_pair(card_accent) | curses.A_BOLD)
+            prompt = "Вы > " if not self.is_busy else "Ожидание... "
+            avail = box_w - len(prompt) - 4
+            shown = self.buf[-avail:] if len(self.buf) > avail else self.buf
+            self.stdscr.addstr(my - 4, 2, "┃ ", curses.color_pair(card_accent) | curses.A_BOLD)
+            self.stdscr.addstr(prompt, curses.color_pair(9) | (curses.A_DIM if self.is_busy else curses.A_BOLD))
+            self.stdscr.addstr(shown, curses.color_pair(9))
+            self.stdscr.addstr(my - 3, 2, "┃ ", curses.color_pair(card_accent) | curses.A_BOLD)
+            self.stdscr.addstr(self.mode.capitalize(), curses.color_pair(card_accent) | curses.A_BOLD)
+            self.stdscr.addstr(f" · {model_label} · {self.provider_label()} [{self.model_flag()}]", curses.color_pair(9) | curses.A_DIM)
+            self.stdscr.addstr(my - 2, 2, "┃", curses.color_pair(card_accent) | curses.A_BOLD)
+            if self.is_busy:
+                self.draw_busy_indicator(my - 1, 2)
+            else:
+                q_lbl = "● цитаты://run"
+                q_attr = (curses.color_pair(2) | curses.A_BOLD) if self.run_in_quotes else (curses.color_pair(8) | curses.A_DIM)
+                self.stdscr.addstr(my - 1, 2, q_lbl, q_attr)
+                cwd_x = 2 + len(q_lbl) + 2
+                if main_w - cwd_x > 34:
+                    self.stdscr.addstr(my - 1, cwd_x, cwd_short[:main_w - cwd_x - 30], curses.color_pair(8) | curses.A_DIM)
+                r_hints = "tab режимы   ctrl+p команды"
+                if main_w > len(r_hints) + len(q_lbl) + 6:
+                    self.stdscr.addstr(my - 1, main_w - len(r_hints) - 2, r_hints, curses.color_pair(8) | curses.A_DIM)
+            if side_w:
+                self.stdscr.addstr(my - 1, main_w + 2, "● SuperCode 2.1"[:side_w - 2], curses.color_pair(2) | curses.A_BOLD)
+            self.stdscr.move(my - 4, min(box_w, 4 + len(prompt) + len(shown)))
+        except curses.error:
+            pass
+        self.stdscr.refresh()
+
+    def confirm(self, level):
+        self.add_log(3, f"  [Подтвердите ({'sudo/rm' if level == 'CAUTION' else 'ASK ALL'}): Y = да / N = нет]")
+        self.status = "Жду Y/N..."
+        self.draw()
+        while True:
+            ch = self.get_key_blocking()
+            if ch in ("y", "Y", "д", "Д", "\n", "\r", curses.KEY_ENTER):
+                return True
+            if ch in ("n", "N", "н", "Н", "\x1b"):
+                return False
+
+    def exec_cmd(self, cmd):
+        if self.mode == "PLAN":
+            self.add_log(3, f"  [PLAN: команда \"{cmd}\" заблокирована]")
+            return "Ошибка: режим PLAN, выполнение запрещено."
+        lvl = classify_cmd(cmd)
+        self.add_log(1, f"  ⚙ Выполнение: `{cmd}`")
+        if lvl == "DANGER":
+            msg = "ЗАБЛОКИРОВАНО: критически опасная команда."
+            self.add_log(4, f"  [{msg}]\n")
+            return msg
+        if (self.sec == "ASK ALL" or (self.sec == "SAFE AUTO" and lvl == "CAUTION")) and not self.confirm(lvl):
+            msg = "Отклонено пользователем."
+            self.add_log(4, f"  [{msg}]\n")
+            return msg
+        self.status = f"Команда: {cmd[:18]}..."
+        try:
+            r = subprocess.run(cmd, shell=True, text=True, capture_output=True, timeout=60)
+            out = (r.stdout + r.stderr).strip() or f"(готово, код: {r.returncode})"
+        except subprocess.TimeoutExpired:
+            out = "(таймаут 60 сек)"
+        except Exception as e:
+            out = f"(ошибка: {e})"
+        self.add_log(1, "  ┌─ Вывод ─────────────────────────────")
+        for line in out[:2000].splitlines():
+            self.add_log(8, f"  │ {line}")
+        self.add_log(1, "  └─────────────────────────────────────\n")
+        return shrink_text(out, 900)
+
+    def send_msg(self, text):
+        if not self.model:
+            self.add_log(3, "● Сначала скачайте модель! Открываю окно загрузки [Ctrl+D]...")
+            self.open_download_modal()
+            if not self.model:
+                return
+        if self.user_turns == 0:
+            self.sess_title = f"Обсуждение: {text[:24]}"
+        self.add_log(9, "┃ ")
+        self.add_log(9, f"┃ {text}")
+        self.add_log(9, "┃ ")
+        self.add_log(8, "")
+        self.user_turns += 1
+        api_text = text
+        if self.mode == "BUILD" and self.user_turns % 2 == 0:
+            api_text += (
+                "\n\n[СИСТЕМНАЯ ПАМЯТКА: Ты автономный CLI-агент на ПК пользователя. "
+                "Тебе РАЗРЕШЕНО и НУЖНО выполнять команды самому через //run <команда> "
+                "и создавать файлы через //write <файл> ... //end. "
+                "НЕ заставляй пользователя запускать команды вручную и НЕ оборачивай //run в ```!]"
+            )
+        self.msgs.append({"role": "user", "content": api_text})
+        self.compact_context()
+        self.is_busy = True
+        self.abort_event.clear()
+        t_start = time.time()
+        self.think_start = t_start
+        self.gen_phase = "wait"
+
+        def worker():
+            interrupted = False
+            for step in range(1, 6):
+                if self.abort_event.is_set():
+                    interrupted = True
+                    break
+                self.status = f"Думаю (шаг {step})..."
+                res_box = {"reply": None, "err": None}
+
+                live_state = {"th": "", "txt": "", "base_len": len(self.log), "active": False}
+
+                def _refresh_live():
+                    if not self.stream_mode:
+                        return
+                    del self.log[live_state["base_len"]:]
+                    if self.show_thinking and live_state["th"]:
+                        self.log.append((7, "  ┌─ 💭 Мысли (генерирует...) ────────"))
+                        for ln in live_state["th"].splitlines() or [""]:
+                            self.log.append((8, f"  │ {ln}"))
+                        self.log.append((7, "  └─────────────────────────────────────"))
+                    if live_state["txt"]:
+                        for ln in live_state["txt"].splitlines() or [""]:
+                            self.log.append((8, f"  {ln}"))
+                    self.scroll = 0
+                    live_state["active"] = True
+
+                def on_chunk(kind, piece):
+                    if kind == "think":
+                        if self.gen_phase != "think":
+                            self.gen_phase = "think"
+                            self.think_start = time.time()
+                        live_state["th"] += piece
+                    else:
+                        if "<think>" in piece or ("<think>" in live_state["txt"] and "</think>" not in live_state["txt"]):
+                            if self.gen_phase != "think":
+                                self.gen_phase = "think"
+                                self.think_start = time.time()
+                        elif self.gen_phase != "text":
+                            self.gen_phase = "text"
+                        live_state["txt"] += piece
+                    _refresh_live()
+
+                def api_call():
+                    try:
+                        opts = dict(self.gen_opts, show_thinking=self.show_thinking)
+                        if self.stream_mode:
+                            res_box["reply"] = chat_stream(self.cfg, self.model, self.msgs, opts, on_chunk=on_chunk, abort_ev=self.abort_event)
+                        else:
+                            res_box["reply"] = chat(self.cfg, self.model, self.msgs, opts)
+                    except Exception as ex:
+                        res_box["err"] = ex
+
+                th = threading.Thread(target=api_call, daemon=True)
+                th.start()
+                while th.is_alive():
+                    if self.abort_event.is_set():
+                        interrupted = True
+                        break
+                    time.sleep(0.05)
+                if interrupted:
+                    break
+                if res_box["err"] is not None:
+                    self.add_log(4, f"  [Ошибка API]: {res_box['err']}")
+                    break
+                if live_state["active"]:
+                    del self.log[live_state["base_len"]:]
+                reply = res_box["reply"] or ""
+                self.msgs.append({"role": "assistant", "content": reply})
+                a = parse_reply(reply, allow_run=(self.mode == "BUILD"), allow_quoted_run=self.run_in_quotes)
+                if a.get("thinking"):
+                    self.render_thinking_body(a["thinking"])
+                if a["visible"]:
+                    self.render_ai_body(a["visible"])
+                if a["write"]:
+                    write_file, write_buf = a["write"]
+                    try:
+                        fp = Path(write_file).expanduser()
+                        fp.parent.mkdir(parents=True, exist_ok=True)
+                        fp.write_text("\n".join(write_buf), encoding="utf-8")
+                        w_msg = f"Файл {fp} успешно записан ({len(write_buf)} строк)."
+                        self.add_log(1, f"  ✔ {w_msg}\n")
+                    except Exception as e:
+                        w_msg = f"Ошибка записи файла: {e}"
+                        self.add_log(4, f"  ✘ {w_msg}\n")
+                    self.msgs.append({"role": "user", "content": w_msg})
+                elif a["need_ctx"]:
+                    self.msgs.append({"role": "user", "content": self.read_last_context()})
+                elif a["cmd"]:
+                    cmd_out = self.exec_cmd(a["cmd"])
+                    penalty = ""
+                    if a.get("quoted_run"):
+                        self.add_log(4, "  ⚠ ШТРАФ: модель обернула //run в кавычки/блок кода")
+                        penalty = (
+                            "\n[СИСТЕМНЫЙ ШТРАФ: ТЫ ОБЕРНУЛ //run В ОБРАТНЫЕ КАВЫЧКИ/ЦИТАТУ (` или ```)! "
+                            "ПИСАТЬ ТАКИМ ОБРАЗОМ КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО! "
+                            "Команда была выполнена только в режиме совместимости. "
+                            "Впредь пиши //run <команда> СТРОГО с новой строки БЕЗ ``` и БЕЗ `!]\n"
+                        )
+                    self.msgs.append({"role": "user", "content": f"Вывод `{a['cmd']}`:\n{cmd_out}{penalty}"})
+                else:
+                    break
+                self.compact_context()
+            elapsed = time.time() - t_start
+            self.render_ai_footer("прервано" if interrupted else f"{elapsed:.1f}с")
+            self.save_session()
+            self.status = "Готов"
+            self.is_busy = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def run(self):
+        self.last_esc_time = 0.0
+        while True:
+            self.draw()
+            try:
+                ch = self.stdscr.get_wch()
+            except curses.error:
+                continue
+
+            # Двойное нажатие Esc во время генерации -> прерывание
+            if ch == "\x1b":
+                if self.is_busy:
+                    now = time.time()
+                    if now - self.last_esc_time < 1.2:
+                        self.abort_event.set()
+                        self.status = "Прерывание..."
+                        self.last_esc_time = 0.0
+                    else:
+                        self.last_esc_time = now
+                continue
+
+            # Комбинации Ctrl+X ... работают всегда (даже во время генерации)
+            if self.pending_ctrl_x:
+                self.pending_ctrl_x = False
+                if ch in ("l", "L", "\x0c"):
+                    self.open_session_selector()
+                elif ch in ("m", "M", "\r"):
+                    self.open_model_selector()
+                elif ch in ("n", "N", "\x0e") and not self.is_busy:
+                    self.new_session()
+                continue
+
+            if ch == "\x18":
+                self.pending_ctrl_x = True
+            elif ch == "\x10":
+                self.open_palette()
+            elif ch == "\x04":
+                self.open_download_modal()
+            elif ch == curses.KEY_F6:
+                self.toggle_quote_run()
+            elif ch == "\x19":
+                self.copy_last_reply()
+            elif ch == "\x02":
+                self.show_sidebar = not self.show_sidebar
+            elif ch == curses.KEY_MOUSE:
+                try:
+                    _, _, _, _, bstate = curses.getmouse()
+                    if bstate & curses.BUTTON4_PRESSED:
+                        self.scroll += 3
+                    elif bstate & curses.BUTTON5_PRESSED:
+                        self.scroll = max(0, self.scroll - 3)
+                except curses.error:
+                    pass
+            elif ch == "\t":
+                self.toggle_mode()
+            elif ch == curses.KEY_F2:
+                self.toggle_sec()
+            elif ch == curses.KEY_F3:
+                self.toggle_ctx()
+            elif ch == curses.KEY_F4:
+                self.cycle_preset()
+            elif ch == curses.KEY_F5:
+                self.toggle_mouse()
+            elif ch == curses.KEY_PPAGE:
+                self.scroll += 5
+            elif ch == curses.KEY_NPAGE:
+                self.scroll = max(0, self.scroll - 5)
+            elif not self.is_busy:
+                if ch in ("\n", "\r", curses.KEY_ENTER):
+                    t, self.buf = self.buf.strip(), ""
+                    if not t:
+                        continue
+                    if t in ("/exit", "/quit"):
+                        self.save_session()
+                        break
+                    elif t == "/new":
+                        self.new_session()
+                    elif t in ("/sessions", "/load"):
+                        self.open_session_selector()
+                    elif t in ("/download", "/pull"):
+                        self.open_download_modal()
+                    elif t == "/copy":
+                        self.copy_last_reply()
+                    elif t in ("/quote", "/quotes"):
+                        self.toggle_quote_run()
+                    elif t == "/mouse":
+                        self.toggle_mouse()
+                    elif t == "/mode":
+                        self.toggle_mode()
+                    elif t == "/sec":
+                        self.toggle_sec()
+                    elif t == "/ctx":
+                        self.toggle_ctx()
+                    elif t == "/preset":
+                        self.cycle_preset()
+                    elif t in ("/model", "/models"):
+                        self.open_model_selector()
+                    elif t in ("/auth", "/provider", "/providers"):
+                        curses.def_prog_mode()
+                        curses.endwin()
+                        try:
+                            cmd_auth()
+                            self.cfg = load_config()
+                        finally:
+                            curses.reset_prog_mode()
+                            self.stdscr.refresh()
+                        self.add_log(3, "● Настройки провайдеров обновлены")
+                    elif t == "/info":
+                        p, model, pname = self.model_info()
+                        self.add_log(1, f"● {model} · {p.get('name', pname)} [{self.model_flag()}] @ {p.get('baseURL', '')}")
+                    else:
+                        self.send_msg(t)
+                elif ch in (curses.KEY_BACKSPACE, "\b", "\x7f"):
+                    self.buf = self.buf[:-1]
+                elif isinstance(ch, str) and ch.isprintable():
+                    self.buf += ch
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="supercode",
+        description="SuperCode — свободный opencode-подобный агент для почти любой модели (локальной или бесплатной).",
+    )
+    parser.add_argument("command", nargs="?", default="tui", choices=["tui", "models", "auth", "run", "config"],
+                        help="tui (по умолчанию), models, auth, run, config")
+    parser.add_argument("prompt", nargs="*", help="задача для 'run' или имя провайдера для 'auth'")
+    parser.add_argument("-m", "--model", help="модель в формате provider/model")
+    parser.add_argument("-p", "--preset", choices=list(PRESETS.keys()), default=None)
+    args = parser.parse_args(argv)
+
+    cfg = load_config()
+    if args.model:
+        cfg["model"] = args.model
+
+    if args.command == "models":
+        return cmd_models(cfg)
+    if args.command == "auth":
+        return cmd_auth(args.prompt[0] if args.prompt else None)
+    if args.command == "config":
+        ensure_providers_file()
+        print(f"Конфиг:  {PROVIDERS_FILE}")
+        print(f"Сессии:  {SESS_DIR}")
+        return 0
+
+    ref = args.model or choose_start_model(cfg)
+    if args.command == "run":
+        prompt = " ".join(args.prompt).strip()
+        if not prompt:
+            print('Использование: supercode run "задача" [-m provider/model] [-p CODE]')
+            return 2
+        try:
+            _, p, _ = resolve_model(cfg, ref)
+        except Exception as e:
+            print(f"[SuperCode] {e}")
+            return 1
+        if p.get("type") == "ollama":
+            ensure_ollama(p.get("baseURL") or API_URL)
+        opts = dict(PRESETS[args.preset or "BALANCED"])
+        return headless_agent(cfg, ref, prompt, opts)
+
+    if ref:
+        try:
+            _, p, _ = resolve_model(cfg, ref)
+            if p.get("type") == "ollama":
+                ensure_ollama(p.get("baseURL") or API_URL)
+        except Exception as e:
+            print(f"[SuperCode] {e}")
+    curses.wrapper(SuperCodeTUI, cfg, ref)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
