@@ -85,6 +85,20 @@ LOGO = [
     "▀▀▀ ▀▀▀ ▀   ▀▀▀ ▀ ▀ ▀▀▀ ▀▀▀ ▀▀  ▀▀▀",
 ]
 
+READY_MODELS = [
+    ("qwen2.5:1.5b",      "Qwen 1.5B — сверхлёгкая (~1.0 ГБ)"),
+    ("qwen3:1.7b",        "Qwen3 ~2B — компактная (~1.4 ГБ)"),
+    ("qwen2.5:3b",        "Qwen 3B — быстрая (~1.9 ГБ)"),
+    ("qwen3:4b",          "Qwen3 4B — умная компактная (~2.7 ГБ)"),
+    ("qwen2.5:7b",        "Qwen 7B — сбалансированная (~4.7 ГБ)"),
+    ("qwen3:8b",          "Qwen3 8B — универсальная (~5.2 ГБ)"),
+    ("gemma2:9b",         "Gemma2 ~10B — точная (~5.5 ГБ)"),
+    ("gemma3:12b",        "Gemma3 12B — продвинутая (~8.1 ГБ)"),
+    ("qwen3:14b",         "Qwen3 14B — мощная (~9.3 ГБ)"),
+    ("qwen2.5-coder:14b", "Qwen Coder ~15B — для кода (~9.0 ГБ)"),
+    ("qwen3:32b",         "Qwen3 32B — максимальная (~20 ГБ)"),
+]
+
 def shrink_text(text, max_chars=900):
     lines = text.splitlines()
     if len(text) <= max_chars and len(lines) <= 22:
@@ -220,19 +234,37 @@ def check_ollama(base=API_URL):
 
 def ensure_ollama(base=API_URL):
     if not shutil.which("ollama"):
-        print("\033[93m[SuperCode] Ollama не найдена. Локальные модели недоступны.\033[0m")
-        print("  Установите одной командой: curl -fsSL https://ollama.com/install.sh | sh")
-        return False
-    if check_ollama(base):
-        return True
-    print("\033[93m[SuperCode] Запуск службы Ollama в фоне...\033[0m")
-    subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-    for _ in range(15):
-        time.sleep(1)
-        if check_ollama(base):
-            return True
-    print("\033[91m[SuperCode] Не удалось запустить сервер Ollama.\033[0m")
-    return False
+        print("\033[93m[SuperCode] Ollama не найдена на ПК.\033[0m")
+        print("  1 — Установить Ollama сейчас (curl -fsSL https://ollama.com | sh)")
+        print("  2 — Настроить облачный API-провайдер (supercode auth)")
+        print("  Enter — Пропустить")
+        ans = input("Ваш выбор [1/2]: ").strip()
+        if ans == "1":
+            os.system("curl -fsSL https://ollama.com | sh")
+            if not shutil.which("ollama"):
+                print("\033[91m[SuperCode] Не удалось установить Ollama.\033[0m")
+                return False
+        elif ans == "2":
+            cmd_auth()
+            return False
+        else:
+            return False
+    if not check_ollama(base):
+        print("\033[93m[SuperCode] Запуск службы Ollama в фоне...\033[0m")
+        subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        for _ in range(15):
+            time.sleep(1)
+            if check_ollama(base):
+                break
+        else:
+            print("\033[91m[SuperCode] Не удалось запустить сервер Ollama.\033[0m")
+            return False
+    if not discover_ollama_models(base):
+        print("\033[93m[SuperCode] Внимание: локальные LLM-модели в Ollama не найдены!\033[0m")
+        ans = input("Открыть меню установки готовых моделей при запуске TUI? [Y/n]: ").strip().lower()
+        if ans not in ("n", "no", "н", "нет"):
+            os.environ["SUPERCODE_OPEN_DL"] = "1"
+    return True
 
 
 def discover_ollama_models(base=API_URL, timeout=2):
@@ -761,10 +793,14 @@ class SuperCodeTUI:
         curses.init_pair(12, build_fg, bg_main)
         self.stdscr.bkgd(" ", curses.color_pair(8))
 
+        if not discover_ollama_models():
+            self.add_log(3, "⚠ Предупреждение: локальные LLM-модели в Ollama не установлены!")
+            self.add_log(1, "Нажмите [Ctrl+D] и откройте вкладку «3. Готовые» для быстрой установки.\n")
         if not self.model:
-            self.add_log(3, "● Ни одной модели не найдено.")
-            self.add_log(1, "Нажмите [Ctrl+D] чтобы скачать локальную модель, или настройте провайдера:")
-            self.add_log(7, f"  supercode auth   (файл: {PROVIDERS_FILE})\n")
+            self.add_log(3, "● Активная модель не выбрана.")
+            self.add_log(7, f"  Настройте API через supercode auth ({PROVIDERS_FILE}) или скачайте локальную.\n")
+        if os.environ.pop("SUPERCODE_OPEN_DL", "") == "1":
+            self.open_download_modal(default_tab=2)
         self.run()
 
     @property
@@ -1291,99 +1327,76 @@ class SuperCodeTUI:
             elif isinstance(ch, str) and ch.isprintable():
                 query += ch
 
-    def open_download_modal(self):
-        tab = 0
-        inp = ""
-        hf_results = []
-        hf_sel = 0
+    def open_download_modal(self, default_tab=0):
+        tab, inp, hf_results, hf_sel, ready_sel = default_tab, "", [], 0, 0
         hf_status = "Введите запрос (напр. qwen coder) и нажмите Enter"
-
         while True:
             self.draw()
             my, mx = self.stdscr.getmaxyx()
-            w = min(72, mx - 4)
-            h = min(16, my - 2)
+            w, h = min(76, mx - 4), min(19, my - 2)
             y0, x0 = max(1, (my - h) // 2), max(2, (mx - w) // 2)
-
             for dy in range(h):
-                try:
-                    self.stdscr.addstr(y0 + dy, x0, " " * w, curses.color_pair(9))
-                except curses.error:
-                    pass
-
+                try: self.stdscr.addstr(y0 + dy, x0, " " * w, curses.color_pair(9))
+                except curses.error: pass
             try:
                 self.stdscr.addstr(y0 + 1, x0 + 2, "Загрузка модели", curses.color_pair(9) | curses.A_BOLD)
                 self.stdscr.addstr(y0 + 1, x0 + w - 5, "esc", curses.color_pair(9) | curses.A_DIM)
-
-                t1_attr = (curses.color_pair(6) | curses.A_BOLD) if tab == 0 else (curses.color_pair(9) | curses.A_DIM)
-                t2_attr = (curses.color_pair(6) | curses.A_BOLD) if tab == 1 else (curses.color_pair(9) | curses.A_DIM)
-                self.stdscr.addstr(y0 + 3, x0 + 2, " 1. Ollama Pull ", t1_attr)
-                self.stdscr.addstr(y0 + 3, x0 + 20, " 2. Hugging Face (GGUF) ", t2_attr)
-                self.stdscr.addstr(y0 + 3, x0 + w - 18, "[←/→ Tab] вкладка", curses.color_pair(9) | curses.A_DIM)
-
-                lbl = "Команда / тег:" if tab == 0 else "Поиск на HF:"
-                self.stdscr.addstr(y0 + 5, x0 + 2, f"{lbl} {inp}_"[:w - 4], curses.color_pair(10 if tab == 0 else 11) | curses.A_BOLD)
-
+                tabs, cx = [" 1. Ollama Pull ", " 2. Hugging Face ", " 3. Готовые "], x0 + 2
+                for ti, tname in enumerate(tabs):
+                    attr = (curses.color_pair(6) | curses.A_BOLD) if tab == ti else (curses.color_pair(9) | curses.A_DIM)
+                    self.stdscr.addstr(y0 + 3, cx, tname, attr)
+                    cx += len(tname) + 1
+                self.stdscr.addstr(y0 + 3, x0 + w - 13, "[Tab] вкладка", curses.color_pair(9) | curses.A_DIM)
+                if tab in (0, 1):
+                    lbl = "Команда / тег:" if tab == 0 else "Поиск на HF:"
+                    self.stdscr.addstr(y0 + 5, x0 + 2, f"{lbl} {inp}_"[:w - 4], curses.color_pair(10 if tab == 0 else 11) | curses.A_BOLD)
                 if tab == 0:
-                    hints = [
-                        "Примеры для ввода:",
-                        "  qwen2.5-coder:3b      (быстрая для кода, ~1.9 ГБ)",
-                        "  qwen3.5:4b            (умная универсальная, ~2.7 ГБ)",
-                        "  llama3.2:3b           (лёгкая модель от Meta)",
-                        "Нажмите [Enter] для начала скачивания.",
-                    ]
-                    for idx, hl in enumerate(hints):
-                        if 7 + idx < h - 1:
-                            self.stdscr.addstr(y0 + 7 + idx, x0 + 2, hl[:w - 4], curses.color_pair(9) | curses.A_DIM)
-                else:
+                    for idx, hl in enumerate(["Примеры: qwen2.5-coder:3b, qwen3:4b, qwen3:8b", "Нажмите [Enter] для скачивания в Ollama."]):
+                        self.stdscr.addstr(y0 + 7 + idx, x0 + 2, hl[:w - 4], curses.color_pair(9) | curses.A_DIM)
+                elif tab == 1:
                     self.stdscr.addstr(y0 + 6, x0 + 2, hf_status[:w - 4], curses.color_pair(11))
                     max_r = h - 9
                     start_r = max(0, hf_sel - max_r + 1)
                     for r_i in range(max_r):
                         idx = start_r + r_i
-                        if idx >= len(hf_results):
-                            break
+                        if idx >= len(hf_results): break
                         repo_id, dls = hf_results[idx]
                         row_txt = f"hf.co/{repo_id}".ljust(w - 14)[:w - 14] + f" ↓{dls}"
-                        attr = (curses.color_pair(6) | curses.A_BOLD) if idx == hf_sel else curses.color_pair(9)
-                        self.stdscr.addstr(y0 + 8 + r_i, x0 + 2, row_txt[:w - 4], attr)
-            except curses.error:
-                pass
+                        self.stdscr.addstr(y0 + 8 + r_i, x0 + 2, row_txt[:w - 4], (curses.color_pair(6) | curses.A_BOLD) if idx == hf_sel else curses.color_pair(9))
+                else:
+                    self.stdscr.addstr(y0 + 5, x0 + 2, "Выберите готовую модель (1.5B – 32B) и нажмите Enter:", curses.color_pair(11))
+                    max_r = h - 8
+                    start_r = max(0, ready_sel - max_r + 1)
+                    for r_i in range(max_r):
+                        idx = start_r + r_i
+                        if idx >= len(READY_MODELS): break
+                        m_tag, m_desc = READY_MODELS[idx]
+                        row_txt = f"  {m_tag:<20} {m_desc}"[:w - 4].ljust(w - 4)
+                        self.stdscr.addstr(y0 + 7 + r_i, x0 + 2, row_txt, (curses.color_pair(6) | curses.A_BOLD) if idx == ready_sel else curses.color_pair(9))
+            except curses.error: pass
             self.stdscr.refresh()
-
             ch = self.get_key_blocking()
-            if ch in ("\x1b", "\x04"):
-                return
-            elif ch in ("\t", curses.KEY_LEFT, curses.KEY_RIGHT):
-                tab = 1 - tab
-                inp = ""
-            elif ch == curses.KEY_UP and tab == 1 and hf_results:
-                hf_sel = (hf_sel - 1) % len(hf_results)
-            elif ch == curses.KEY_DOWN and tab == 1 and hf_results:
-                hf_sel = (hf_sel + 1) % len(hf_results)
-            elif ch in (curses.KEY_BACKSPACE, "\b", "\x7f"):
-                inp = inp[:-1]
+            if ch in ("\x1b", "\x04"): return
+            elif ch in ("\t", curses.KEY_RIGHT): tab, inp = (tab + 1) % 3, ""
+            elif ch == curses.KEY_LEFT: tab, inp = (tab - 1) % 3, ""
+            elif ch == curses.KEY_UP:
+                if tab == 1 and hf_results: hf_sel = (hf_sel - 1) % len(hf_results)
+                elif tab == 2: ready_sel = (ready_sel - 1) % len(READY_MODELS)
+            elif ch == curses.KEY_DOWN:
+                if tab == 1 and hf_results: hf_sel = (hf_sel + 1) % len(hf_results)
+                elif tab == 2: ready_sel = (ready_sel + 1) % len(READY_MODELS)
+            elif ch in (curses.KEY_BACKSPACE, "\b", "\x7f") and tab in (0, 1): inp = inp[:-1]
             elif ch in ("\n", "\r", curses.KEY_ENTER):
-                if tab == 0 and inp.strip():
-                    self.run_pull_process(inp.strip())
-                    return
-                elif tab == 1:
-                    if hf_results and not inp.strip():
-                        repo_id, _ = hf_results[hf_sel]
-                        self.run_pull_process(f"hf.co/{repo_id}")
-                        return
-                    elif inp.strip():
-                        hf_status = "Поиск на Hugging Face..."
-                        self.draw()
-                        try:
-                            hf_results = search_hf_gguf(inp.strip())
-                            hf_sel = 0
-                            inp = ""
-                            hf_status = f"Найдено: {len(hf_results)} (↑/↓ выбор, Enter — скачать в Ollama)" if hf_results else "Ничего не найдено"
-                        except Exception as e:
-                            hf_status = f"Ошибка поиска HF: {str(e)[:40]}"
-            elif isinstance(ch, str) and ch.isprintable():
-                inp += ch
+                if tab == 0 and inp.strip(): self.run_pull_process(inp.strip()); return
+                elif tab == 1 and hf_results and not inp.strip(): self.run_pull_process(f"hf.co/{hf_results[hf_sel][0]}"); return
+                elif tab == 1 and inp.strip():
+                    hf_status = "Поиск на Hugging Face..."; self.draw()
+                    try:
+                        hf_results, hf_sel, inp = search_hf_gguf(inp.strip()), 0, ""
+                        hf_status = f"Найдено: {len(hf_results)}" if hf_results else "Ничего не найдено"
+                    except Exception as e: hf_status = f"Ошибка HF: {str(e)[:40]}"
+                elif tab == 2: self.run_pull_process(READY_MODELS[ready_sel][0]); return
+            elif isinstance(ch, str) and ch.isprintable() and tab in (0, 1): inp += ch
 
     def open_palette(self):
         query, sel = "", 0
@@ -2120,13 +2133,9 @@ def main(argv=None):
         opts = dict(PRESETS[args.preset or "BALANCED"])
         return headless_agent(cfg, ref, prompt, opts)
 
-    if ref:
-        try:
-            _, p, _ = resolve_model(cfg, ref)
-            if p.get("type") == "ollama":
-                ensure_ollama(p.get("baseURL") or API_URL)
-        except Exception as e:
-            print(f"[SuperCode] {e}")
+    ensure_ollama(cfg.get("providers", {}).get("ollama", {}).get("baseURL") or API_URL)
+    cfg = load_config()
+    ref = args.model or choose_start_model(cfg)
     curses.wrapper(SuperCodeTUI, cfg, ref)
     return 0
 
