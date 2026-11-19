@@ -14,7 +14,8 @@ import threading
 import time
 import urllib.error
 import urllib.parse
-import urllib.request
+import urllib.request, webbrowser, socket
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
 API_URL = "http://127.0.0.1:11434"
@@ -39,13 +40,7 @@ TIPS = [
     "В режиме SMART SSD старый контекст уходит на диск и доступен по //lastcontext",
 ]
 
-PROMPT_BUILD = (
-    "Ты — локальный CLI-агент на ПК пользователя в Ubuntu (SuperCode, BUILD). Отвечай кратко на русском.\n"
-    "У тебя ЕСТЬ полный доступ к терминалу и файлам. НИКОГДА не отказывайся и не пиши что у тебя нет доступа!\n"
-    "1) Чтобы выполнить команду bash, напиши с новой строки:\n//run <команда>\n"
-    "2) Чтобы создать или перезаписать файл с кодом, напиши:\n//write <имя_файла>\n<весь код файла>\n//end\n"
-    "3) Если старый контекст выгружен на SSD и нужны детали, напиши:\n//lastcontext"
-)
+PROMPT_BUILD = 'Ты — честный и точный CLI-агент SuperCode в Ubuntu с доступом к терминалу и интернету.\nСТРОГИЕ ПРАВИЛА:\n1) НИКОГДА не выдумывай факты, цифры, названия или ссылки! Если данных нет — честно скажи об этом.\n2) Опирайся ТОЛЬКО на реальный вывод команд и скачанных веб-страниц.\n3) Твои встроенные команды (строго с новой строки без ```):\n//run <bash-команда> — выполнить команду в терминале\n//search <запрос> — найти информацию в интернете (автоматически скачает первые 5 сайтов)\n//netget <url> — скачать ТОЛЬКО текстовую веб-страницу (видео, фото и музыка ЗАПРЕЩЕНЫ!)\n//write <файл>\n<код>\n//end — записать файл\n4) Для поиска в сети пиши //search <запрос> ОДИН раз, затем сразу отвечай по скачанным текстам.'
 PROMPT_PLAN = (
     "Ты — ИИ-консультант в Ubuntu (SuperCode, PLAN). Отвечай кратко на русском. "
     "В режиме PLAN ЗАПРЕЩЕНО писать //run и //write. Если нужен старый контекст с SSD, напиши //lastcontext."
@@ -107,6 +102,75 @@ def shrink_text(text, max_chars=900):
         res = "\n".join(lines[:10]) + f"\n... [сжато {len(lines)-18} строк] ...\n" + "\n".join(lines[-8:])
         return res[:max_chars] + ("\n...[обрезано]" if len(res) > max_chars else "")
     return text[:max_chars // 2] + "\n... [сжато] ...\n" + text[-(max_chars // 2):]
+
+def web_search_ddg(query, limit=5):
+    import html as _html
+    from html.parser import HTMLParser
+    class _DDG(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.links, self.snips, self.cur_href, self.in_a, self.in_sn, self.buf = [], [], "", False, False, []
+        def handle_starttag(self, tag, attrs):
+            d = dict(attrs)
+            if tag == "a" and d.get("href"):
+                self.cur_href, self.in_a, self.buf = d["href"], True, []
+            elif tag == "td" and "result-snippet" in d.get("class", ""):
+                self.in_sn, self.buf = True, []
+        def handle_data(self, data):
+            if self.in_a or self.in_sn: self.buf.append(data)
+        def handle_endtag(self, tag):
+            if tag == "a" and self.in_a:
+                self.links.append((self.cur_href, "".join(self.buf).strip()))
+                self.in_a = False
+            elif tag == "td" and self.in_sn:
+                self.snips.append(" ".join("".join(self.buf).split()))
+                self.in_sn = False
+    host = "html." + "duckduckgo." + "com"
+    u = "https://" + host + "/lite/?" + urllib.parse.urlencode({"q": query, "kl": "ru-ru"})
+    hdr = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Gecko/20100101 Firefox/131.0"}
+    try:
+        page = urllib.request.urlopen(urllib.request.Request(u, headers=hdr), timeout=12).read().decode("utf-8", errors="ignore")
+        pr = _DDG()
+        pr.feed(page)
+        out = []
+        for raw_href, title in pr.links:
+            href = _html.unescape(raw_href)
+            if "uddg=" in href:
+                href = urllib.parse.parse_qs(urllib.parse.urlparse(href).query).get("uddg", [href])[0]
+            elif href.startswith("//"):
+                href = "https:" + href
+            if not href.startswith("http") or "duckduckgo.com" in href or is_media_url(href) or not title: continue
+            sn = pr.snips[len(out)] if len(out) < len(pr.snips) else ""
+            out.append(f"{len(out)+1}. {title}\n   URL: {href}\n   {sn}")
+            if len(out) >= limit: break
+        return "\n\n".join(out) if out else f"Нет совпадений (HTML {len(page)} байт)."
+    except Exception as e:
+        return f"Ошибка поиска: {e}"
+
+MEDIA_EXT_RE = re.compile(r"\.(mp4|avi|mkv|webm|mov|mp3|wav|ogg|flac|aac|m4a|jpg|jpeg|png|gif|webp|svg|bmp|ico|pdf|zip|rar|7z|exe|apk)(\?|$)", re.I)
+MEDIA_DOM_RE = re.compile(r"(youtube\.com|youtu\.be|rutube\.ru|tiktok\.com|vimeo\.com|twitch\.tv|soundcloud\.com|soundinstants\.com|myinstants\.com|shazam\.com|spotify\.com|music\.yandex|vk\.com/(video|audio|clips))", re.I)
+
+def is_media_url(u):
+    return bool(MEDIA_EXT_RE.search(u) or MEDIA_DOM_RE.search(u))
+
+def web_netget(url, max_chars=4500):
+    try:
+        if is_media_url(url):
+            return "ЗАПРЕЩЕНО: Скачивание видео, фото, музыки и медиа-сайтов запрещено! Используй только текстовые страницы."
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            ctype = resp.headers.get("Content-Type", "").lower()
+            if ctype and not any(t in ctype for t in ("text/", "json", "xml", "xhtml")):
+                return f"ЗАПРЕЩЕНО: Сервер вернул медиа/бинарный файл ({ctype}). Разрешён только текст!"
+            raw = resp.read().decode("utf-8", errors="ignore")
+        clean = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", raw, flags=re.S | re.I)
+        clean = re.sub(r"<[^>]+>", " ", clean)
+        clean = re.sub(r"\s+", " ", clean).strip()
+        return clean[:max_chars] + ("\n...[обрезано]" if len(clean) > max_chars else "")
+    except Exception as e:
+        return f"Ошибка скачивания {url}: {e}"
 
 def classify_cmd(cmd):
     c = cmd.strip()
@@ -200,6 +264,35 @@ def ensure_providers_file():
             PROVIDERS_FILE.write_text(default_config_text(), encoding="utf-8")
     except Exception:
         pass
+
+
+def clean_and_scan_providers(mode="smart"):
+    raw = load_raw_config()
+    ollama_models = discover_ollama_models()
+    for pname, pdata in raw.get("providers", {}).items():
+        if not isinstance(pdata, dict):
+            continue
+        if mode == "simple":
+            if not pdata.get("local") and pdata.get("type") != "ollama":
+                pdata["apiKey"] = ""
+            pdata["models"] = list(ollama_models) if pdata.get("type") == "ollama" else []
+            pdata.pop("label", None)
+            pdata.pop("tags", None)
+        else:
+            key = (pdata.get("apiKey") or "").strip()
+            env_val = os.environ.get(key[1:], "") if key.startswith("$") else key
+            if pdata.get("type") == "ollama":
+                pdata["models"] = list(ollama_models)
+            elif not pdata.get("local") and not env_val:
+                pdata["apiKey"] = ""
+                pdata["models"] = []
+                pdata.pop("label", None)
+                pdata.pop("tags", None)
+    if mode == "simple":
+        raw["model"] = f"ollama/{ollama_models[0]}" if ollama_models else ""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    PROVIDERS_FILE.write_text(json.dumps(raw, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return ollama_models
 
 
 def load_config():
@@ -367,7 +460,7 @@ def chat(cfg, ref, messages, gen_opts):
             opts["top_k"] = int(gen_opts["top_k"])
         if gen_opts.get("repeat_penalty") is not None:
             opts["repeat_penalty"] = float(gen_opts["repeat_penalty"])
-        payload = {"model": model, "messages": messages, "stream": False, "think": bool(gen_opts.get("show_thinking", False)), "options": opts}
+        payload = {"model": model, "messages": messages, "stream": False, "think": bool(gen_opts.get("show_thinking", False)), "keep_alive": ("20m" if gen_opts.get("keep_alive", True) else "5m"), "options": opts}
         try:
             resp = _post_json(f"{base}/api/chat", payload, extra)
         except RuntimeError as e:
@@ -449,7 +542,7 @@ def chat_stream(cfg, ref, messages, gen_opts, on_chunk=None, abort_ev=None):
         if gen_opts.get("repeat_penalty") is not None:
             opts["repeat_penalty"] = float(gen_opts["repeat_penalty"])
         think_val = effort if effort in ("low", "medium", "high") else show_th
-        payload = {"model": model, "messages": messages, "stream": True, "think": think_val, "options": opts}
+        payload = {"model": model, "messages": messages, "stream": True, "think": think_val, "keep_alive": ("20m" if gen_opts.get("keep_alive", True) else "5m"), "options": opts}
         try:
             resp = urllib.request.urlopen(_req(f"{base}/api/chat", payload, extra), timeout=300)
         except urllib.error.HTTPError as e:
@@ -532,7 +625,7 @@ def parse_reply(reply, allow_run=True, allow_quoted_run=False):
             thoughts.append(m.group(1).strip())
         return ""
     reply = re.sub(r"<think>(.*?)</think>", _grab_think, reply, flags=re.S)
-    vis, cmd, need_ctx, quoted_run = [], None, False, False
+    vis, cmd, need_ctx, quoted_run, search_q, netget_u = [], None, False, False, None, None
     write_file, write_buf, in_write, in_code = None, [], False, False
     for line in reply.splitlines():
         s = line.strip()
@@ -567,6 +660,14 @@ def parse_reply(reply, allow_run=True, allow_quoted_run=False):
             if re.match(r"^\s*//lastcon[a-z]*\s*$", line, re.I):
                 need_ctx = True
                 continue
+            ms = re.match(r"^\s*//search\s+(.+)$", line, re.I)
+            if ms and search_q is None:
+                search_q = ms.group(1).strip()
+                continue
+            mn = re.match(r"^\s*//netget\s+(\S+)$", line, re.I)
+            if mn and netget_u is None:
+                netget_u = mn.group(1).strip()
+                continue
             if allow_run and cmd is None:
                 m = re.match(r"^\s*//run\s+(.+)$", line)
                 if m:
@@ -579,7 +680,7 @@ def parse_reply(reply, allow_run=True, allow_quoted_run=False):
         "cmd": cmd,
         "quoted_run": quoted_run,
         "write": (write_file, write_buf) if write_file else None,
-        "need_ctx": need_ctx,
+        "need_ctx": need_ctx, "search": search_q, "netget": netget_u,
     }
 
 
@@ -754,7 +855,19 @@ class SuperCodeTUI:
         self.mouse_on = False
         self.stream_mode = True
         self.run_in_quotes = False
-        self.show_thinking = False
+        self.show_thinking = True
+        self.allow_color_text = False
+        self.truncate_cmd_log = True
+        self.web_search_on = True
+        self.search_limit = 5
+        self.netget_on = True
+        self.netget_max = 4500
+        self.keep_alive = True
+        self.api_keys = {}
+        self.custom_api_url = ''
+        self.ollama_url = 'http://127.0.0.1:11434'
+        self._web_srv = None
+        self.last_thought_sec = 0.0
         self.think_start = 0.0
         self.gen_phase = "wait"
         self._sys_cache = (0.0, [])
@@ -791,6 +904,8 @@ class SuperCodeTUI:
         curses.init_pair(10, build_fg, bg_card)
         curses.init_pair(11, curses.COLOR_YELLOW, bg_card)
         curses.init_pair(12, build_fg, bg_main)
+        curses.init_pair(13, curses.COLOR_WHITE, bg_main)
+        curses.init_pair(14, curses.COLOR_CYAN, bg_card)
         self.stdscr.bkgd(" ", curses.color_pair(8))
 
         if not discover_ollama_models():
@@ -801,6 +916,11 @@ class SuperCodeTUI:
             self.add_log(7, f"  Настройте API через supercode auth ({PROVIDERS_FILE}) или скачайте локальную.\n")
         if os.environ.pop("SUPERCODE_OPEN_DL", "") == "1":
             self.open_download_modal(default_tab=2)
+        start_sid = os.environ.pop("SUPERCODE_START_SID", "")
+        if start_sid:
+            sp = SESS_DIR / f"session_{start_sid.removeprefix('session_')}.json"
+            if sp.exists(): self.load_session(sp)
+            else: self.add_log(4, f"● Сессия {start_sid} не найдена")
         self.run()
 
     @property
@@ -837,12 +957,45 @@ class SuperCodeTUI:
                 d = json.loads(CFG_FILE.read_text(encoding="utf-8"))
                 self.preset_name = d.get("preset", self.preset_name)
                 self.gen_opts.update(d.get("gen_opts", {}))
-                self.show_thinking = bool(d.get("show_thinking", False))
+                self.show_thinking = bool(d.get("show_thinking", True))
+                self.allow_color_text = bool(d.get("allow_color_text", False))
+                self.truncate_cmd_log = bool(d.get("truncate_cmd_log", True))
+                self.web_search_on = bool(d.get("web_search_on", True))
+                self.search_limit = int(d.get("search_limit", 5))
+                self.netget_on = bool(d.get("netget_on", True))
+                self.netget_max = int(d.get("netget_max", 4500))
+                self.keep_alive = bool(d.get("keep_alive", True))
+                self.api_keys = dict(d.get("api_keys", {}))
+                self.custom_api_url = str(d.get("custom_api_url", ""))
+                self.ollama_url = str(d.get("ollama_url", "http://127.0.0.1:11434"))
             except Exception:
                 pass
 
     def save_cfg(self):
-        CFG_FILE.write_text(json.dumps({"preset": self.preset_name, "gen_opts": self.gen_opts, "show_thinking": self.show_thinking}, indent=2), encoding="utf-8")
+        try:
+            CFG_DIR.mkdir(parents=True, exist_ok=True)
+            data = {}
+            if CFG_FILE.exists():
+                try: data = json.loads(CFG_FILE.read_text(encoding="utf-8"))
+                except Exception: data = {}
+            data.update({
+                "model": self.model,
+                "gen_opts": self.gen_opts,
+                "show_thinking": self.show_thinking,
+                "allow_color_text": self.allow_color_text,
+                "truncate_cmd_log": self.truncate_cmd_log,
+                "web_search_on": self.web_search_on,
+                "search_limit": self.search_limit,
+                "netget_on": self.netget_on,
+                "netget_max": self.netget_max,
+                "keep_alive": self.keep_alive,
+                "api_keys": self.api_keys,
+                "custom_api_url": self.custom_api_url,
+                "ollama_url": self.ollama_url,
+            })
+            CFG_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
 
     def est_tokens(self):
         return sum(len(m["content"]) for m in self.msgs) // 3
@@ -1014,13 +1167,29 @@ class SuperCodeTUI:
         self.save_cfg()
         self.add_log(3, f"● Показ мыслей модели: {'ВКЛ' if self.show_thinking else 'ВЫКЛ'}")
 
-    def render_thinking_body(self, text):
-        if not text or not self.show_thinking:
+    def toggle_trunc_log(self):
+        self.truncate_cmd_log = not self.truncate_cmd_log
+        self.save_cfg()
+        self.add_log(3, f"● Обрезка лога команды для модели: {'ВКЛ (до 900 симв.)' if self.truncate_cmd_log else 'ВЫКЛ (весь вывод)'}")
+
+    def toggle_color_text(self):
+        self.allow_color_text = not self.allow_color_text
+        self.save_cfg()
+        self.add_log(3, f"● Цветной текст модели: {'ВКЛ' if self.allow_color_text else 'ВЫКЛ'}")
+
+    def render_thinking_body(self, text, duration=None):
+        dur_str = f": {duration:.1f}s" if duration else ""
+        if not text:
+            if duration and duration > 0.2:
+                self.add_log(3, f"  + Thought{dur_str}")
             return
-        self.add_log(7, "  ┌─ 💭 Мысли модели ───────────────────")
+        if not self.show_thinking:
+            self.add_log(3, f"  + Thought{dur_str}  (F7 — развернуть)")
+            return
+        self.add_log(3, f"  ∴ Thinking{dur_str}")
         for line in text.splitlines():
-            self.add_log(8, f"  │ {line}")
-        self.add_log(7, "  └─────────────────────────────────────")
+            self.add_log(13, f"  ┃ {line}")
+        self.add_log(8, "")
 
     def toggle_quote_run(self):
         self.run_in_quotes = not self.run_in_quotes
@@ -1062,26 +1231,24 @@ class SuperCodeTUI:
         for line in text.splitlines():
             s = line.strip()
             if s.startswith("```"):
+                in_code = not in_code
+                self.add_log(14, f"┃ {s[3:].strip()}" if in_code else "┃ ")
                 if not in_code:
-                    in_code = True
-                    lbl = f" {s[3:].strip()} " if s[3:].strip() else " КОД "
-                    self.add_log(7, f"  ┌─{lbl}" + "─" * max(4, 38 - len(lbl)))
-                else:
-                    in_code = False
-                    self.add_log(7, "  └" + "─" * 40)
+                    self.add_log(8, "")
             elif in_code:
-                self.add_log(7, f"  │ {line}")
+                self.add_log(14, f"┃ {line}")
             else:
                 self.add_log(8, f"  {line}")
         if in_code:
-            self.add_log(7, "  └" + "─" * 40)
+            self.add_log(8, "")
 
     def render_ai_footer(self, status_suffix=""):
         mode_lbl = "Build" if self.mode == "BUILD" else "Plan"
         sq_color = 12 if self.mode == "BUILD" else 3
-        m_name = self.model_short()
+        eff = self.gen_opts.get("reasoning_effort", "auto")
+        eff_str = f" · {eff}" if eff != "auto" else ""
         extra = f" · {status_suffix}" if status_suffix else ""
-        self.add_log(sq_color, f"  ▣ {mode_lbl} · {m_name} · {self.provider_label()} [{self.model_flag()}]{extra}")
+        self.add_log(sq_color, f"  ▣ {mode_lbl} · {self.model_short()} · {self.provider_label()}{eff_str}{extra}")
         self.add_log(8, "")
 
     def toggle_mode(self):
@@ -1174,6 +1341,39 @@ class SuperCodeTUI:
         self.is_busy = False
         self.status = "Готов"
 
+    def confirm_clean_and_scan(self):
+        mode = "simple"
+        while True:
+            self.draw()
+            my, mx = self.stdscr.getmaxyx()
+            w, h = min(64, mx - 4), 11
+            y0, x0 = max(1, (my - h) // 2), max(2, (mx - w) // 2)
+            for dy in range(h):
+                try: self.stdscr.addstr(y0 + dy, x0, " " * w, curses.color_pair(9))
+                except curses.error: pass
+            try:
+                self.stdscr.addstr(y0 + 1, x0 + 2, "⚠ Очистка API-ключей и сканирование Ollama", curses.color_pair(4) | curses.A_BOLD)
+                self.stdscr.addstr(y0 + 3, x0 + 2, "Будут удалены сохранённые API-ключи и метки,", curses.color_pair(9))
+                self.stdscr.addstr(y0 + 4, x0 + 2, "после чего заново просканируются модели Ollama.", curses.color_pair(9))
+                m_lbl = "Режим: [Tab] " + ("ПРОСТОЕ (удалить ВСЕ ключи)" if mode == "simple" else "УМНОЕ (только пустые ключи)")
+                self.stdscr.addstr(y0 + 6, x0 + 2, m_lbl[:w - 4], curses.color_pair(11) | curses.A_BOLD)
+                self.stdscr.addstr(y0 + 8, x0 + 2, "[Y / Enter] Подтвердить    [N / Esc] Отмена", curses.color_pair(6) | curses.A_BOLD)
+            except curses.error: pass
+            self.stdscr.refresh()
+            ch = self.get_key_blocking()
+            if ch in ("\x1b", "n", "N", "н", "Н"):
+                return
+            elif ch == "\t":
+                mode = "smart" if mode == "simple" else "simple"
+            elif ch in ("y", "Y", "д", "Д", "\n", "\r", curses.KEY_ENTER):
+                found = clean_and_scan_providers(mode)
+                self.cfg = load_config()
+                self.models = [m["ref"] for m in provider_models(self.cfg)]
+                self.model = choose_start_model(self.cfg)
+                save_model_choice(self.model)
+                self.add_log(2, f"● Очистка ({mode}) завершена. Найдено моделей Ollama: {len(found)}")
+                return
+
     def open_model_selector(self):
         entries = provider_models(self.cfg)
         self.models = [m["ref"] for m in entries]
@@ -1189,6 +1389,7 @@ class SuperCodeTUI:
                 tag = f"{m['provider_name'][:16]} [{flags}]"
                 items.append((m["model"], tag, "model", m["ref"]))
             items.append(("Скачать модель в Ollama (Ollama / HuggingFace)...", "ctrl+d", "download", None))
+            items.append(("Очистить все ключи/метки и сканировать Ollama...", "сброс", "clean_scan", None))
             sel = max(0, min(sel, len(items) - 1))
 
             self.draw()
@@ -1249,6 +1450,16 @@ class SuperCodeTUI:
                     self.add_log(3, f"● Выбрана модель: {self.model_short()} · {self.provider_label()} [{self.model_flag()}]")
                 elif act == "download":
                     self.open_download_modal()
+                elif act == "clean_smart":
+                    found = clean_and_scan_providers("smart")
+                    self.cfg = load_config()
+                    self.models = [m["ref"] for m in provider_models(self.cfg)]
+                    if not self.model:
+                        self.model = choose_start_model(self.cfg)
+                        save_model_choice(self.model)
+                    self.add_log(2, f"● Умная очистка выполнена. Моделей Ollama: {len(found)}")
+                elif act == "clean_simple":
+                    self.confirm_clean_and_scan()
                 return
             elif isinstance(ch, str) and ch.isprintable():
                 query += ch
@@ -1398,161 +1609,325 @@ class SuperCodeTUI:
                 elif tab == 2: self.run_pull_process(READY_MODELS[ready_sel][0]); return
             elif isinstance(ch, str) and ch.isprintable() and tab in (0, 1): inp += ch
 
-    def open_palette(self):
-        query, sel = "", 0
+    WEB_UI_HTML = """<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8"><title>SuperCode — Панель настроек</title>
+<style>
+:root{--bg:#0f1117;--card:#181b24;--inp:#222634;--acc:#6366f1;--acc2:#10b981;--txt:#e2e8f0;--mut:#94a3b8;--brd:#2d3344}
+*{box-sizing:border-box;font-family:system-ui,-apple-system,sans-serif}body{margin:0;background:var(--bg);color:var(--txt);padding:24px}
+.wrap{max-width:860px;margin:0 auto}.hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px}
+h1{margin:0;font-size:22px;background:linear-gradient(90deg,#818cf8,#34d399);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}@media(max-width:700px){.grid{grid-template-columns:1fr}}
+.card{background:var(--card);border:1px solid var(--brd);border-radius:14px;padding:18px;box-shadow:0 8px 24px rgba(0,0,0,.25)}
+.card h2{margin:0 0 14px;font-size:15px;color:#a5b4fc;text-transform:uppercase;letter-spacing:.5px}
+.row{margin-bottom:12px}.row label{display:block;font-size:12px;color:var(--mut);margin-bottom:4px}
+input,select{width:100%;padding:9px 11px;border-radius:8px;border:1px solid var(--brd);background:var(--inp);color:var(--txt);font-size:13px}
+.chk{display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px;margin:8px 0}.chk input{width:auto;accent-color:var(--acc)}
+.btn{background:var(--acc);color:#fff;border:none;padding:11px 22px;border-radius:9px;font-weight:600;cursor:pointer;font-size:14px}
+.btn:hover{opacity:.9}.btn-sm{padding:6px 10px;font-size:12px;background:#ef4444;border-radius:6px;border:none;color:#fff;cursor:pointer}
+.key-item{display:flex;gap:8px;margin-bottom:8px;align-items:center}.toast{position:fixed;bottom:20px;right:20px;background:var(--acc2);color:#062;padding:12px 18px;border-radius:10px;font-weight:700;display:none}
+</style></head><body><div class="wrap"><div class="hdr"><h1>⚡ SuperCode — Локальные настройки</h1><div style="display:flex;gap:10px"><button class="btn" style="background:#ef4444" onclick="clearSess()">Очистить сессии</button><button class="btn" onclick="save()">Сохранить все</button></div></div>
+<div class="grid"><div class="card"><h2>🤖 Модель и Ollama</h2>
+<div class="row"><label>Активная модель</label><select id="model"></select></div>
+<div class="row"><label>URL сервера Ollama</label><input id="ollama_url"></div>
+<label class="chk"><input type="checkbox" id="keep_alive"> Не выгружать модель (таймаут 20 мин)</label>
+<label class="chk"><input type="checkbox" id="show_thinking"> Показывать мысли модели (Ctrl+Q)</label>
+<label class="chk"><input type="checkbox" id="allow_color_text"> Цветной текст ответов модели</label>
+<label class="chk"><input type="checkbox" id="truncate_cmd_log"> Обрезать длинный лог команд (до 900 симв.)</label></div>
+<div class="card"><h2>🎛 Параметры генерации</h2>
+<div class="row"><label>Temperature (0.0 — 2.0)</label><input type="number" step="0.05" id="temperature"></div>
+<div class="row"><label>Top P (0.0 — 1.0)</label><input type="number" step="0.05" id="top_p"></div>
+<div class="row"><label>Top K (1 — 100)</label><input type="number" id="top_k"></div>
+<div class="row"><label>Repeat Penalty (1.0 — 2.0)</label><input type="number" step="0.05" id="repeat_penalty"></div></div>
+<div class="card"><h2>🌐 Поиск и интернет (DuckDuckGo / NetGet)</h2>
+<label class="chk"><input type="checkbox" id="web_search_on"> Разрешить поиск в интернете (//search)</label>
+<div class="row"><label>Количество результатов поиска (1 — 15)</label><input type="number" min="1" max="15" id="search_limit"></div>
+<label class="chk"><input type="checkbox" id="netget_on"> Разрешить чтение страниц (//netget)</label>
+<div class="row"><label>Лимит текста на загрузку (символов)</label><input type="number" step="500" min="1000" max="20000" id="netget_max"></div></div>
+<div class="card"><h2>🔑 API-ключи и кастомный эндпоинт</h2>
+<div class="row"><label>Custom / OpenAI-совместимый API URL</label><input id="custom_api_url" placeholder="https://openrouter.ai"></div>
+<div class="row"><label>OpenRouter API Key</label><input type="password" id="key_openrouter" placeholder="sk-or-..."></div>
+<div class="row"><label>OpenAI / Custom API Key</label><input type="password" id="key_openai" placeholder="sk-..."></div>
+<div class="row"><label>GitHub Token (для репозиториев)</label><input type="password" id="key_github" placeholder="ghp_..."></div></div></div></div>
+<div class="toast" id="toast">✔ Настройки сохранены и применены!</div>
+<script>
+async function load(){const r=await fetch('/api/cfg');const d=await r.json();const ms=document.getElementById('model');
+ms.innerHTML=(d.models||[d.model]).map(m=>`<option value="${m}">${m}</option>`).join('');ms.value=d.model;
+['ollama_url','custom_api_url','search_limit','netget_max'].forEach(k=>document.getElementById(k).value=d[k]??'');
+['keep_alive','show_thinking','allow_color_text','truncate_cmd_log','web_search_on','netget_on'].forEach(k=>document.getElementById(k).checked=!!d[k]);
+['temperature','top_p','top_k','repeat_penalty'].forEach(k=>document.getElementById(k).value=d.gen_opts[k]);
+const ak=d.api_keys||{};document.getElementById('key_openrouter').value=ak.openrouter||'';
+document.getElementById('key_openai').value=ak.openai||'';document.getElementById('key_github').value=ak.github||'';}
+async function save(){const body={model:document.getElementById('model').value,ollama_url:document.getElementById('ollama_url').value,
+custom_api_url:document.getElementById('custom_api_url').value,search_limit:+document.getElementById('search_limit').value,
+netget_max:+document.getElementById('netget_max').value,keep_alive:document.getElementById('keep_alive').checked,
+show_thinking:document.getElementById('show_thinking').checked,allow_color_text:document.getElementById('allow_color_text').checked,
+truncate_cmd_log:document.getElementById('truncate_cmd_log').checked,web_search_on:document.getElementById('web_search_on').checked,
+netget_on:document.getElementById('netget_on').checked,gen_opts:{temperature:+document.getElementById('temperature').value,
+top_p:+document.getElementById('top_p').value,top_k:+document.getElementById('top_k').value,repeat_penalty:+document.getElementById('repeat_penalty').value},
+api_keys:{openrouter:document.getElementById('key_openrouter').value,openai:document.getElementById('key_openai').value,github:document.getElementById('key_github').value}};
+await fetch('/api/cfg',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+const t=document.getElementById('toast');t.style.display='block';setTimeout(()=>t.style.display='none',2500);}async function clearSess(){if(!confirm("Удалить ВСЕ сохранённые сессии?"))return;const r=await fetch("/api/clear_sessions",{method:"POST"});const d=await r.json();alert("Удалено сессий: "+d.deleted);}
+load();
+</script></body></html>"""
+
+    def _open_url_quiet(self, url):
+        import subprocess
+        try:
+            subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        except Exception:
+            pass
+        try:
+            self.stdscr.clear()
+            self.stdscr.refresh()
+        except Exception:
+            pass
+
+    def _open_url_quiet(self, url):
+        import subprocess
+        try:
+            subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        except Exception:
+            pass
+        try:
+            self.stdscr.clear()
+            self.stdscr.refresh()
+        except Exception:
+            pass
+
+    def clear_all_sessions(self):
+        cnt = 0
+        if SESS_DIR.exists():
+            for fp in SESS_DIR.glob("session_*.json"):
+                try:
+                    fp.unlink()
+                    cnt += 1
+                except Exception:
+                    pass
+        self.sess_id = time.strftime("%Y%m%d_%H%M%S")
+        self.sess_title = "Новая сессия"
+        self.log.clear()
+        self.scroll = 0
+        pr = PROMPT_BUILD if self.mode == "BUILD" else PROMPT_PLAN
+        self.msgs = [{"role": "system", "content": pr}]
+        self.add_log(3, f"● Все старые сессии удалены ({cnt} шт.), начата чистая сессия.")
+        return cnt
+
+    def launch_web_dashboard(self):
+        app = self
+        if getattr(self, "_web_url", None):
+            self._open_url_quiet(self._web_url)
+            self.add_log(3, f"● Веб-настройки открыты в браузере: {self._web_url}")
+            return
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *a): pass
+            def do_GET(self):
+                if self.path == "/api/cfg":
+                    try:
+                        raw = urllib.request.urlopen(f"{app.ollama_url}/api/tags", timeout=2).read().decode()
+                        models = [m["name"] for m in json.loads(raw).get("models", [])]
+                    except Exception:
+                        models = [app.model]
+                    if app.model not in models: models.insert(0, app.model)
+                    data = {
+                        "model": app.model, "models": models, "ollama_url": app.ollama_url,
+                        "custom_api_url": app.custom_api_url, "api_keys": app.api_keys,
+                        "keep_alive": app.keep_alive, "show_thinking": app.show_thinking,
+                        "allow_color_text": app.allow_color_text, "truncate_cmd_log": app.truncate_cmd_log,
+                        "web_search_on": app.web_search_on, "search_limit": app.search_limit,
+                        "netget_on": app.netget_on, "netget_max": app.netget_max, "gen_opts": app.gen_opts
+                    }
+                    b = json.dumps(data, ensure_ascii=False).encode("utf-8")
+                    self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers(); self.wfile.write(b)
+                else:
+                    b = app.WEB_UI_HTML.encode("utf-8")
+                    self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.end_headers(); self.wfile.write(b)
+            def do_POST(self):
+                if self.path == "/api/clear_sessions":
+                    n = app.clear_all_sessions()
+                    b = json.dumps({"deleted": n}).encode("utf-8")
+                    self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers(); self.wfile.write(b)
+                    return
+                if self.path == "/api/cfg":
+                    ln = int(self.headers.get("Content-Length", 0))
+                    d = json.loads(self.rfile.read(ln).decode("utf-8"))
+                    app.model = d.get("model", app.model)
+                    app.ollama_url = d.get("ollama_url", app.ollama_url)
+                    app.custom_api_url = d.get("custom_api_url", app.custom_api_url)
+                    app.api_keys = d.get("api_keys", app.api_keys)
+                    for k in ("keep_alive", "show_thinking", "allow_color_text", "truncate_cmd_log", "web_search_on", "netget_on"):
+                        if k in d: setattr(app, k, bool(d[k]))
+                    app.search_limit = int(d.get("search_limit", app.search_limit))
+                    app.netget_max = int(d.get("netget_max", app.netget_max))
+                    if "gen_opts" in d: app.gen_opts.update(d["gen_opts"])
+                    app.save_cfg()
+                    app.add_log(3, f"● Настройки обновлены через веб-панель (модель: {app.model})")
+                    try: app.stdscr.touchwin()
+                    except Exception: pass
+                    try: app.stdscr.touchwin()
+                    except Exception: pass
+                    self.send_response(200); self.end_headers(); self.wfile.write(b'{"ok":true}')
+        srv = HTTPServer(("127.0.0.1", 0), Handler)
+        port = srv.server_address[1]
+        self._web_url = f"http://127.0.0.1:{port}"
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self._open_url_quiet(self._web_url)
+        self.add_log(3, f"● Веб-панель настроек запущена: {self._web_url}")
+
+    def open_web_settings(self):
+        sel = 0
         while True:
-            all_items = [
-                ("Рекомендуемые", "Переключить сессию", "ctrl+x l", "sessions", None),
-                ("Рекомендуемые", f"Выбрать модель ({self.model_short()} · {self.provider_label()})", "ctrl+x m", "model", None),
-                ("Рекомендуемые", "Новая сессия", "ctrl+x n", "new", None),
-                ("Рекомендуемые", "Скачать модель (Ollama / HuggingFace)", "ctrl+d", "download", None),
-                ("Рекомендуемые", "Скопировать последний ответ ИИ", "ctrl+y", "copy", None),
-                ("Рекомендуемые", "Настроить провайдера / API-ключи (auth)", "", "auth", None),
-                ("Генерация", f"Показ мыслей модели ({'ВКЛ' if self.show_thinking else 'ВЫКЛ'})", "", "thinking", None),
-                ("Генерация", f"Пресет: {self.preset_name} (CODE / BALANCED / CREATIVE)", "f4", "preset", None),
-                ("Генерация", f"Температура (Temperature): {self.gen_opts['temperature']}", "", "temp", None),
-                ("Генерация", f"Top-P: {self.gen_opts['top_p']}", "", "top_p", None),
-                ("Генерация", f"Top-K: {self.gen_opts['top_k']}", "", "top_k", None),
-                ("Генерация", f"Штраф за повторы (Repeat Penalty): {self.gen_opts['repeat_penalty']}", "", "rep", None),
-                ("Система", f"Переключить режим агента ({self.mode.capitalize()})", "tab", "mode", None),
-                ("Система", f"Уровень безопасности ({self.sec})", "f2", "sec", None),
-                ("Система", f"Режим контекста ({self.ctx_mode})", "f3", "ctx", None),
-                ("Система", f"Выполнять //run в цитатах ({'ВКЛ' if self.run_in_quotes else 'ВЫКЛ'})", "f6", "quote_run", None),
-                ("Система", f"Режим мыши ({'Прокрутка' if self.mouse_on else 'Выделение'})", "f5", "mouse", None),
-                ("Система", "Показать / скрыть боковую панель", "ctrl+b", "sidebar", None),
-                ("Система", "Обновить список моделей (все провайдеры)", "", "refresh", None),
+            rows = [
+                ("Поиск DuckDuckGo (//search)", "ВКЛ" if self.web_search_on else "ВЫКЛ"),
+                ("Количество результатов поиска", f"{self.search_limit} шт."),
+                ("Скачивание страниц (//netget)", "ВКЛ" if self.netget_on else "ВЫКЛ"),
+                ("Лимит текста //netget", f"{self.netget_max} симв."),
+                ("Не выгружать модель (Ollama)", "ВКЛ (таймаут 20м)" if self.keep_alive else "ВЫКЛ (5 мин)"),
             ]
-
-            items = [it for it in all_items if query.lower() in f"{it} {it}".lower()]
-            if not items:
-                items = [("Система", "Ничего не найдено", "", "none", None)]
-            sel = max(0, min(sel, len(items) - 1))
-
             self.draw()
             my, mx = self.stdscr.getmaxyx()
-            w = min(68, mx - 4)
-            h = min(len(items) + 7, my - 2)
+            w, h = min(64, mx - 4), 10
             y0, x0 = max(1, (my - h) // 2), max(2, (mx - w) // 2)
             for dy in range(h):
-                try:
-                    self.stdscr.addstr(y0 + dy, x0, " " * w, curses.color_pair(9))
-                except curses.error:
-                    pass
+                try: self.stdscr.addstr(y0 + dy, x0, " " * w, curses.color_pair(9))
+                except curses.error: pass
             try:
-                self.stdscr.addstr(y0 + 1, x0 + 2, "Команды", curses.color_pair(9) | curses.A_BOLD)
+                self.stdscr.addstr(y0 + 1, x0 + 2, "Настройки поиска и сети", curses.color_pair(9) | curses.A_BOLD)
                 self.stdscr.addstr(y0 + 1, x0 + w - 5, "esc", curses.color_pair(9) | curses.A_DIM)
-                s_disp = f"Поиск: {query}_" if query else "Поиск"
-                self.stdscr.addstr(y0 + 3, x0 + 2, s_disp[:w - 4], curses.color_pair(9) | (0 if query else curses.A_DIM))
-                max_rows = h - 6
-                start_row = max(0, sel - max_rows + 1)
-                last_cat = None
-                row_cursor = 0
-                for idx in range(start_row, len(items)):
-                    if row_cursor >= max_rows:
-                        break
-                    cat, title, hk, _, _ = items[idx]
-                    if cat != last_cat and row_cursor < max_rows - 1:
-                        self.stdscr.addstr(y0 + 5 + row_cursor, x0 + 2, cat, curses.color_pair(11) | curses.A_BOLD)
-                        last_cat = cat
-                        row_cursor += 1
-                    inner_w = w - 4
-                    body = f"  {title}"[:inner_w - len(hk) - 1].ljust(inner_w - len(hk)) + hk
-                    attr = (curses.color_pair(6) | curses.A_BOLD) if idx == sel else curses.color_pair(9)
-                    self.stdscr.addstr(y0 + 5 + row_cursor, x0 + 2, body[:inner_w], attr)
-                    row_cursor += 1
-            except curses.error:
-                pass
+                for i, (lbl, val) in enumerate(rows):
+                    line = f"  {lbl}".ljust(w - len(val) - 6) + f"◀ {val} ▶"
+                    attr = (curses.color_pair(6) | curses.A_BOLD) if i == sel else curses.color_pair(9)
+                    self.stdscr.addstr(y0 + 3 + i, x0 + 2, line[:w - 4], attr)
+                self.stdscr.addstr(y0 + h - 2, x0 + 2, "[↑↓] Выбор   [←→ / Enter] Изменить   [Esc] Готово"[:w - 4], curses.color_pair(9) | curses.A_DIM)
+            except curses.error: pass
             self.stdscr.refresh()
             ch = self.get_key_blocking()
-            if ch in ("\x1b", "\x10"):
-                return
-            elif ch == curses.KEY_UP:
-                sel = (sel - 1) % len(items)
-            elif ch == curses.KEY_DOWN:
-                sel = (sel + 1) % len(items)
-            elif ch in (curses.KEY_BACKSPACE, "\b", "\x7f"):
-                query = query[:-1]
+            if ch == "\x1b": self.save_cfg(); return
+            elif ch == curses.KEY_UP: sel = (sel - 1) % 5
+            elif ch == curses.KEY_DOWN: sel = (sel + 1) % 5
+            elif ch in (curses.KEY_LEFT, curses.KEY_RIGHT, "\n", "\r", curses.KEY_ENTER, " "):
+                d = -1 if ch == curses.KEY_LEFT else 1
+                if sel == 0: self.web_search_on = not self.web_search_on
+                elif sel == 1: self.search_limit = max(1, min(15, self.search_limit + d))
+                elif sel == 2: self.netget_on = not self.netget_on
+                elif sel == 3: self.netget_max = max(1000, min(15000, self.netget_max + d * 500))
+                elif sel == 4: self.keep_alive = not self.keep_alive
+
+    def open_palette(self):
+        query, sel, top_idx = "", 0, 0
+        while True:
+            all_items = [
+                ("Рекомендуемые", "Переключить сессию", "ctrl+x l", "sessions"),
+                ("Рекомендуемые", f"Выбрать модель ({self.model_short()} · {self.provider_label()})", "ctrl+x m", "model"),
+                ("Рекомендуемые", "Новая сессия", "ctrl+x n", "new"),
+                ("Рекомендуемые", "Скачать модель (Ollama / HuggingFace)", "ctrl+d", "download"),
+                ("Рекомендуемые", "Скопировать последний ответ ИИ", "ctrl+y", "copy"),
+                ("Рекомендуемые", f"Настройки поиска, сети и памяти (память: {'ВКЛ' if self.keep_alive else 'ВЫКЛ'})", "", "web_cfg"),
+                ("Рекомендуемые", "Открыть веб-настройки в браузере (localhost)", "", "web_ui"),
+                ("Рекомендуемые", "Очистить все сессии", "", "clear_sess"),
+                ("Рекомендуемые", "Настроить провайдера / API-ключи (auth)", "", "auth"),
+                ("API и модели", "Умная очистка (пустые ключи/метки) + скан Ollama", "", "clean_smart"),
+                ("API и модели", "Полная очистка (все ключи/метки) + скан Ollama", "", "clean_simple"),
+                ("Генерация", f"Обрезка лога команды ({'ВКЛ' if self.truncate_cmd_log else 'ВЫКЛ'})", "", "trunc_log"),
+                ("Генерация", f"Цветной текст модели ({'ВКЛ' if self.allow_color_text else 'ВЫКЛ'})", "", "color_text"),
+                ("Генерация", f"Показ мыслей модели ({'ВКЛ' if self.show_thinking else 'ВЫКЛ'})", "f7", "thinking"),
+                ("Генерация", f"Уровень усилий (Effort: {self.gen_opts.get('reasoning_effort', 'auto')})", "", "effort"),
+                ("Генерация", f"Пресет: {self.preset_name} (CODE / BALANCED / CREATIVE)", "f4", "preset"),
+                ("Генерация", f"Температура (Temperature): {self.gen_opts['temperature']}", "", "temp"),
+                ("Генерация", f"Top-P: {self.gen_opts['top_p']}", "", "top_p"),
+                ("Генерация", f"Top-K: {self.gen_opts['top_k']}", "", "top_k"),
+                ("Генерация", f"Штраф за повторы (Repeat Penalty): {self.gen_opts['repeat_penalty']}", "", "rep"),
+                ("Система", f"Переключить режим агента ({self.mode.capitalize()})", "tab", "mode"),
+                ("Система", f"Уровень безопасности ({self.sec})", "f2", "sec"),
+                ("Система", f"Режим контекста ({self.ctx_mode})", "f3", "ctx"),
+                ("Система", f"Выполнять //run в цитатах ({'ВКЛ' if self.run_in_quotes else 'ВЫКЛ'})", "f6", "quote_run"),
+                ("Система", f"Режим мыши ({'Прокрутка' if self.mouse_on else 'Выделение'})", "f5", "mouse"),
+                ("Система", "Показать / скрыть боковую панель", "ctrl+b", "sidebar"),
+                ("Система", "Обновить список моделей (все провайдеры)", "", "refresh"),
+            ]
+            items = [it for it in all_items if query.lower() in f"{it[0]} {it[1]}".lower()] or [("Система", "Ничего не найдено", "", "none")]
+            sel = max(0, min(sel, len(items) - 1))
+            self.draw()
+            my, mx = self.stdscr.getmaxyx()
+            w, h = min(70, mx - 4), min(len(items) + 9, my - 2)
+            y0, x0 = max(1, (my - h) // 2), max(2, (mx - w) // 2)
+            for dy in range(h):
+                try: self.stdscr.addstr(y0 + dy, x0, " " * w, curses.color_pair(9))
+                except curses.error: pass
+            max_rows = max(4, h - 7)
+            if sel < top_idx: top_idx = sel
+            elif sel >= top_idx + max_rows - 2: top_idx = max(0, sel - max_rows + 3)
+            try:
+                self.stdscr.addstr(y0 + 1, x0 + 2, f"Команды ({sel + 1}/{len(items)})", curses.color_pair(9) | curses.A_BOLD)
+                self.stdscr.addstr(y0 + 1, x0 + w - 12, "↑↓ листать", curses.color_pair(9) | curses.A_DIM)
+                self.stdscr.addstr(y0 + 3, x0 + 2, (f"Поиск: {query}_" if query else "Поиск")[:w - 4], curses.color_pair(9) | (0 if query else curses.A_DIM))
+                if top_idx > 0: self.stdscr.addstr(y0 + 4, x0 + w - 10, "▲ выше", curses.color_pair(11))
+                last_cat, r_cur = None, 0
+                for idx in range(top_idx, len(items)):
+                    if r_cur >= max_rows: break
+                    cat, title, hk, _ = items[idx]
+                    if cat != last_cat and r_cur < max_rows - 1:
+                        self.stdscr.addstr(y0 + 5 + r_cur, x0 + 2, cat, curses.color_pair(11) | curses.A_BOLD)
+                        last_cat, r_cur = cat, r_cur + 1
+                    iw = w - 4
+                    body = f"  {title}"[:iw - len(hk) - 1].ljust(iw - len(hk)) + hk
+                    self.stdscr.addstr(y0 + 5 + r_cur, x0 + 2, body[:iw], (curses.color_pair(6) | curses.A_BOLD) if idx == sel else curses.color_pair(9))
+                    r_cur += 1
+                if top_idx + max_rows - 2 < len(items): self.stdscr.addstr(y0 + h - 2, x0 + w - 10, "▼ ниже", curses.color_pair(11))
+            except curses.error: pass
+            self.stdscr.refresh()
+            ch = self.get_key_blocking()
+            if ch in ("\x1b", "\x10"): return
+            elif ch == curses.KEY_UP: sel = (sel - 1) % len(items)
+            elif ch == curses.KEY_DOWN: sel = (sel + 1) % len(items)
+            elif ch == curses.KEY_PPAGE: sel = max(0, sel - 5)
+            elif ch == curses.KEY_NPAGE: sel = min(len(items) - 1, sel + 5)
+            elif ch in (curses.KEY_BACKSPACE, "\b", "\x7f"): query, top_idx = query[:-1], 0
             elif ch in ("\n", "\r", curses.KEY_ENTER):
-                _, _, _, act, _ = items[sel]
-                if act == "new":
-                    self.new_session()
-                elif act == "sessions":
-                    self.open_session_selector()
-                elif act == "model":
-                    self.open_model_selector()
-                elif act == "copy":
-                    self.copy_last_reply()
-                elif act == "quote_run":
-                    self.toggle_quote_run()
-                elif act == "mouse":
-                    self.toggle_mouse()
-                elif act == "sidebar":
-                    self.show_sidebar = not self.show_sidebar
-                elif act == "thinking":
-                    self.toggle_thinking()
-                elif act == "stream":
-                    self.toggle_stream()
-                elif act == "thinking":
-                    self.toggle_thinking()
-                elif act == "effort":
-                    self.open_effort_selector()
-                elif act == "preset":
-                    self.cycle_preset()
-                elif act == "temp":
-                    v = self.prompt_number("Temperature (0.0 - 1.5)", self.gen_opts["temperature"], False)
+                act = items[sel][3]
+                if act == "new": self.new_session()
+                elif act == "sessions": self.open_session_selector()
+                elif act == "model": self.open_model_selector()
+                elif act == "copy": self.copy_last_reply()
+                elif act == "trunc_log": self.toggle_trunc_log()
+                elif act == "color_text": self.toggle_color_text()
+                elif act == "thinking": self.toggle_thinking()
+                elif act == "effort": self.open_effort_selector()
+                elif act == "preset": self.cycle_preset()
+                elif act == "quote_run": self.toggle_quote_run()
+                elif act == "mouse": self.toggle_mouse()
+                elif act == "sidebar": self.show_sidebar = not self.show_sidebar
+                elif act == "ctx": self.toggle_ctx()
+                elif act == "mode": self.toggle_mode()
+                elif act == "sec": self.toggle_sec()
+                elif act == "download": self.open_download_modal()
+                elif act in ("temp", "top_p", "top_k", "rep"):
+                    kmap = {"temp": ("Temperature (0.0 - 1.5)", "temperature", False), "top_p": ("Top-P (0.1 - 1.0)", "top_p", False), "top_k": ("Top-K (1 - 100)", "top_k", True), "rep": ("Repeat Penalty (1.0 - 1.5)", "repeat_penalty", False)}
+                    t_lbl, k_name, is_i = kmap[act]
+                    v = self.prompt_number(t_lbl, self.gen_opts[k_name], is_i)
                     if v is not None:
-                        self.gen_opts["temperature"] = v
-                        self.preset_name = "CUSTOM"
+                        self.gen_opts[k_name], self.preset_name = v, "CUSTOM"
                         self.save_cfg()
-                elif act == "top_p":
-                    v = self.prompt_number("Top-P (0.1 - 1.0)", self.gen_opts["top_p"], False)
-                    if v is not None:
-                        self.gen_opts["top_p"] = v
-                        self.preset_name = "CUSTOM"
-                        self.save_cfg()
-                elif act == "top_k":
-                    v = self.prompt_number("Top-K (1 - 100)", self.gen_opts["top_k"], True)
-                    if v is not None:
-                        self.gen_opts["top_k"] = v
-                        self.preset_name = "CUSTOM"
-                        self.save_cfg()
-                elif act == "rep":
-                    v = self.prompt_number("Repeat Penalty (1.0 - 1.5)", self.gen_opts["repeat_penalty"], False)
-                    if v is not None:
-                        self.gen_opts["repeat_penalty"] = v
-                        self.preset_name = "CUSTOM"
-                        self.save_cfg()
-                elif act == "ctx":
-                    self.toggle_ctx()
-                elif act == "mode":
-                    self.toggle_mode()
-                elif act == "sec":
-                    self.toggle_sec()
+                elif act == "web_cfg": self.open_web_settings()
+                elif act == "web_ui": self.launch_web_dashboard()
+                elif act == "clear_sess": self.clear_all_sessions()
                 elif act == "auth":
-                    curses.def_prog_mode()
-                    curses.endwin()
-                    try:
-                        cmd_auth()
-                        self.cfg = load_config()
-                    finally:
-                        curses.reset_prog_mode()
-                        self.stdscr.refresh()
+                    curses.def_prog_mode(); curses.endwin()
+                    try: cmd_auth(); self.cfg = load_config()
+                    finally: curses.reset_prog_mode(); self.stdscr.refresh()
+                elif act == "clean_smart":
+                    found = clean_and_scan_providers("smart")
+                    self.cfg = load_config()
+                    self.models = [m["ref"] for m in provider_models(self.cfg)]
                     if not self.model:
                         self.model = choose_start_model(self.cfg)
                         save_model_choice(self.model)
-                    self.add_log(3, "● Настройки провайдеров обновлены")
+                    self.add_log(2, f"● Умная очистка выполнена. Моделей Ollama: {len(found)}")
+                elif act == "clean_simple":
+                    self.confirm_clean_and_scan()
                 elif act == "refresh":
-                    self.cfg = load_config()
-                    self.models = [m["ref"] for m in provider_models(self.cfg)]
-                    if self.models and not self.model:
-                        self.model = choose_start_model(self.cfg)
-                        save_model_choice(self.model)
+                    self.cfg = load_config(); self.models = [m["ref"] for m in provider_models(self.cfg)]
                     self.add_log(3, f"● Найдено моделей: {len(self.models)}")
-                elif act == "download":
-                    self.open_download_modal()
                 return
-            elif isinstance(ch, str) and ch.isprintable():
-                query += ch
+            elif isinstance(ch, str) and ch.isprintable(): query, top_idx = query + ch, 0
 
     def get_sys_metrics(self):
         now = time.time()
@@ -1629,8 +2004,8 @@ class SuperCodeTUI:
             self.stdscr.addstr(y, x, lbl, attr)
             nx = x + len(lbl) + 2
             self.stdscr.addstr(y, nx, "esc", curses.color_pair(8) | curses.A_BOLD)
-            esc_hint = "ещё раз! " if (time.time() - getattr(self, "last_esc_time", 0) < 1.2) else "прервать "
-            self.stdscr.addstr(y, nx + 4, f"{esc_hint}· {self.status}", curses.color_pair(3 if "ещё" in esc_hint else 8) | curses.A_DIM)
+            esc_hint = "прервать "
+            self.stdscr.addstr(y, nx + 4, f"{esc_hint}· {self.status}", curses.color_pair(8) | curses.A_DIM)
         except curses.error:
             pass
 
@@ -1707,12 +2082,43 @@ class SuperCodeTUI:
 
         for i, (c, line) in enumerate(wrapped[max(0, end - chat_h):end]):
             try:
-                if c == 9:
+                if c in (9, 14):
                     self.stdscr.addstr(i, 2, " " * (main_w - 4), curses.color_pair(9))
-                    self.stdscr.addstr(i, 2, "┃", curses.color_pair(card_accent) | curses.A_BOLD)
-                    self.stdscr.addstr(i, 3, line[1:main_w - 4], curses.color_pair(9))
+                    self.stdscr.addstr(i, 2, "┃", curses.color_pair(card_accent if c == 9 else 14) | curses.A_BOLD)
+                    attr = curses.color_pair(9) | (curses.A_BOLD if line.startswith("┃ $ ") else 0)
+                    self.stdscr.addstr(i, 3, line[1:main_w - 4], attr)
+                elif c == 13:
+                    self.stdscr.addstr(i, 1, line[:main_w - 2], curses.color_pair(8) | curses.A_DIM)
                 elif c == 12:
                     self.stdscr.addstr(i, 1, line[:main_w - 2], curses.color_pair(12) | curses.A_BOLD)
+                elif "`" in line and not line.lstrip().startswith("┃"):
+                    cx = 1
+                    for seg in re.split(r"(`[^`]+`)", line):
+                        if not seg or cx >= main_w - 1: continue
+                        if seg.startswith("`") and seg.endswith("`") and len(seg) > 2:
+                            inner = f" {seg[1:-1]} "[:main_w - 1 - cx]
+                            self.stdscr.addstr(i, cx, inner, curses.color_pair(14) | curses.A_BOLD)
+                            cx += len(inner)
+                        else:
+                            part = seg[:main_w - 1 - cx]
+                            self.stdscr.addstr(i, cx, part, curses.color_pair(c) | (curses.A_BOLD if c in (5, 7) else 0))
+                            cx += len(part)
+                elif "<color=" in line:
+                    cmap = {"cyan": 1, "blue": 1, "green": 2, "yellow": 3, "red": 4, "magenta": 7, "white": 8}
+                    cx = 1
+                    for seg in re.split(r"(<color=[a-zA-Z]+>.*?</(?:color|a)>)", line):
+                        if not seg or cx >= main_w - 1:
+                            continue
+                        m = re.match(r"^<color=([a-zA-Z]+)>(.*?)</(?:color|a)>$", seg)
+                        if m and self.allow_color_text:
+                            col_id = cmap.get(m.group(1).lower(), c)
+                            txt_p = m.group(2)[:main_w - 1 - cx]
+                            self.stdscr.addstr(i, cx, txt_p, curses.color_pair(col_id) | curses.A_BOLD)
+                            cx += len(txt_p)
+                        else:
+                            clean_p = re.sub(r"</?(?:color(?:=[a-zA-Z]+)?|a)>", "", seg)[:main_w - 1 - cx]
+                            self.stdscr.addstr(i, cx, clean_p, curses.color_pair(c) | (curses.A_BOLD if c in (5, 7) else 0))
+                            cx += len(clean_p)
                 else:
                     self.stdscr.addstr(i, 1, line[:main_w - 2], curses.color_pair(c) | (curses.A_BOLD if c in (5, 7) else 0))
             except curses.error:
@@ -1811,16 +2217,16 @@ class SuperCodeTUI:
             self.add_log(3, f"  [PLAN: команда \"{cmd}\" заблокирована]")
             return "Ошибка: режим PLAN, выполнение запрещено."
         lvl = classify_cmd(cmd)
-        self.add_log(1, f"  ⚙ Выполнение: `{cmd}`")
         if lvl == "DANGER":
             msg = "ЗАБЛОКИРОВАНО: критически опасная команда."
-            self.add_log(4, f"  [{msg}]\n")
+            self.add_log(4, f"  ✘ {msg}\n")
             return msg
         if (self.sec == "ASK ALL" or (self.sec == "SAFE AUTO" and lvl == "CAUTION")) and not self.confirm(lvl):
             msg = "Отклонено пользователем."
-            self.add_log(4, f"  [{msg}]\n")
+            self.add_log(4, f"  ✘ {msg}\n")
             return msg
         self.status = f"Команда: {cmd[:18]}..."
+        self.add_log(14, f"┃ $ {cmd}")
         try:
             r = subprocess.run(cmd, shell=True, text=True, capture_output=True, timeout=60)
             out = (r.stdout + r.stderr).strip() or f"(готово, код: {r.returncode})"
@@ -1828,11 +2234,14 @@ class SuperCodeTUI:
             out = "(таймаут 60 сек)"
         except Exception as e:
             out = f"(ошибка: {e})"
-        self.add_log(1, "  ┌─ Вывод ─────────────────────────────")
-        for line in out[:2000].splitlines():
-            self.add_log(8, f"  │ {line}")
-        self.add_log(1, "  └─────────────────────────────────────\n")
-        return shrink_text(out, 900)
+        lines = out[:2000].splitlines()
+        self.add_log(14, "┃ ")
+        for line in lines[:12]:
+            self.add_log(14, f"┃ {line}")
+        if len(lines) > 12:
+            self.add_log(14, f"┃ ... (+{len(lines) - 12} строк)")
+        self.add_log(8, "")
+        return shrink_text(out, 900) if self.truncate_cmd_log else out
 
     def send_msg(self, text):
         if not self.model:
@@ -1842,18 +2251,32 @@ class SuperCodeTUI:
                 return
         if self.user_turns == 0:
             self.sess_title = f"Обсуждение: {text[:24]}"
+            os.environ["SUPERCODE_EXIT_TITLE"] = self.sess_title
         self.add_log(9, "┃ ")
         self.add_log(9, f"┃ {text}")
         self.add_log(9, "┃ ")
         self.add_log(8, "")
         self.user_turns += 1
         api_text = text
+        if self.allow_color_text:
+            api_text += (
+                "\n\n[ИНСТРУКЦИЯ ПО ЦВЕТУ: Ты можешь выделять важные слова цветом с помощью тегов "
+                "<color=ЦВЕТ>текст</color> (например: <color=red>ошибка</color>, <color=green>готово</color>, "
+                "<color=yellow>внимание</color>, <color=cyan>инфо</color>, <color=magenta>код</color>). "
+                "Доступные цвета: red, green, yellow, cyan, magenta, blue, white. Не вкладывай теги друг в друга.]"
+            )
         if self.mode == "BUILD" and self.user_turns % 2 == 0:
             api_text += (
                 "\n\n[СИСТЕМНАЯ ПАМЯТКА: Ты автономный CLI-агент на ПК пользователя. "
                 "Тебе РАЗРЕШЕНО и НУЖНО выполнять команды самому через //run <команда> "
                 "и создавать файлы через //write <файл> ... //end. "
                 "НЕ заставляй пользователя запускать команды вручную и НЕ оборачивай //run в ```!]"
+            )
+        if self.mode == "BUILD" and re.search(r"(найд|поищ|ищ|интернет|гугл|google|сайт|ссылк|http|новост|актуальн|сегодня|погод|курс)", text, re.I):
+            api_text += (
+                "\n\n[ИНСТРУКЦИЯ: Пользователь просит найти данные в сети. "
+                "НЕ выдумывай ответ! Напиши ТОЛЬКО команду //search <запрос> (или //netget <url>). "
+                "Система сама скачает первые 5 сайтов и отдаст тебе их текст для ответа.]"
             )
         self.msgs.append({"role": "user", "content": api_text})
         self.compact_context()
@@ -1865,6 +2288,7 @@ class SuperCodeTUI:
 
         def worker():
             interrupted = False
+            search_counts = {}
             for step in range(1, 6):
                 if self.abort_event.is_set():
                     interrupted = True
@@ -1872,19 +2296,36 @@ class SuperCodeTUI:
                 self.status = f"Думаю (шаг {step})..."
                 res_box = {"reply": None, "err": None}
 
-                live_state = {"th": "", "txt": "", "base_len": len(self.log), "active": False}
+                live_state = {"th": "", "txt": "", "base_len": len(self.log), "active": False, "th_dur": 0.0}
+
+                def _split_think(raw):
+                    if "<think>" not in raw:
+                        return "", raw
+                    after = raw.split("<think>", 1)[1]
+                    if "</think>" in after:
+                        a, b = after.split("</think>", 1)
+                        return a.strip(), b.lstrip()
+                    return after.strip(), ""
 
                 def _refresh_live():
                     if not self.stream_mode:
                         return
                     del self.log[live_state["base_len"]:]
-                    if self.show_thinking and live_state["th"]:
-                        self.log.append((7, "  ┌─ 💭 Мысли (генерирует...) ────────"))
-                        for ln in live_state["th"].splitlines() or [""]:
-                            self.log.append((8, f"  │ {ln}"))
-                        self.log.append((7, "  └─────────────────────────────────────"))
-                    if live_state["txt"]:
-                        for ln in live_state["txt"].splitlines() or [""]:
+                    ith, ctxt = _split_think(live_state["txt"])
+                    cur_th = live_state["th"] or ith
+                    if cur_th:
+                        edur = live_state["th_dur"] or (time.time() - self.think_start)
+                        if self.show_thinking:
+                            self.log.append((3, f"  ∴ Thinking ({edur:.1f}s)..."))
+                            for ln in cur_th.splitlines()[-14:]:
+                                self.log.append((13, f"  ┃ {ln}"))
+                        else:
+                            self.log.append((3, f"  + Thinking... ({edur:.1f}s)"))
+                    if ctxt:
+                        if self.gen_phase == "think" and not live_state["th_dur"]:
+                            live_state["th_dur"] = time.time() - self.think_start
+                            self.gen_phase = "text"
+                        for ln in ctxt.splitlines():
                             self.log.append((8, f"  {ln}"))
                     self.scroll = 0
                     live_state["active"] = True
@@ -1900,14 +2341,16 @@ class SuperCodeTUI:
                             if self.gen_phase != "think":
                                 self.gen_phase = "think"
                                 self.think_start = time.time()
-                        elif self.gen_phase != "text":
+                        else:
+                            if self.gen_phase == "think" and not live_state["th_dur"]:
+                                live_state["th_dur"] = time.time() - self.think_start
                             self.gen_phase = "text"
                         live_state["txt"] += piece
                     _refresh_live()
 
                 def api_call():
                     try:
-                        opts = dict(self.gen_opts, show_thinking=self.show_thinking)
+                        opts = dict(self.gen_opts, show_thinking=self.show_thinking, keep_alive=self.keep_alive)
                         if self.stream_mode:
                             res_box["reply"] = chat_stream(self.cfg, self.model, self.msgs, opts, on_chunk=on_chunk, abort_ev=self.abort_event)
                         else:
@@ -1932,8 +2375,9 @@ class SuperCodeTUI:
                 reply = res_box["reply"] or ""
                 self.msgs.append({"role": "assistant", "content": reply})
                 a = parse_reply(reply, allow_run=(self.mode == "BUILD"), allow_quoted_run=self.run_in_quotes)
-                if a.get("thinking"):
-                    self.render_thinking_body(a["thinking"])
+                th_dur = live_state["th_dur"] or ((time.time() - self.think_start) if a.get("thinking") else 0.0)
+                if a.get("thinking") or th_dur > 0.2:
+                    self.render_thinking_body(a["thinking"], duration=th_dur)
                 if a["visible"]:
                     self.render_ai_body(a["visible"])
                 if a["write"]:
@@ -1948,6 +2392,44 @@ class SuperCodeTUI:
                         w_msg = f"Ошибка записи файла: {e}"
                         self.add_log(4, f"  ✘ {w_msg}\n")
                     self.msgs.append({"role": "user", "content": w_msg})
+                elif a.get("search"):
+                    q = a["search"]
+                    if search_counts.get("_total", 0) >= 1:
+                        self.add_log(3, "  ⚠ Поиск уже выполнен, переход к ответу\n")
+                        self.msgs.append({"role": "user", "content": "Поиск и скачивание 5 сайтов УЖЕ ВЫПОЛНЕНЫ. Повторный //search запрещён! Проанализируй скачанные выше тексты и дай точный ответ пользователю со ссылками. Если ответа в текстах нет — честно скажи об этом."})
+                        continue
+                    search_counts["_total"] = 1
+                    self.status = f"Поиск: {q[:18]}..."
+                    if not self.web_search_on:
+                        res = "Поиск в интернете отключён пользователем в настройках."
+                        self.add_log(3, "  ⚠ Поиск отключён в настройках\n")
+                    else:
+                        self.add_log(1, f"  Поиск DuckDuckGo (топ-{self.search_limit}): {q}")
+                        res = web_search_ddg(q, limit=max(5, self.search_limit))
+                        urls = re.findall(r"URL:\s*(https?://\S+)", res)[:5]
+                        self.add_log(1, f"  ✔ Найдено ссылок: {len(urls)}")
+                        pages_txt = []
+                        per_page = max(1200, self.netget_max // max(1, len(urls)))
+                        for idx_u, u_item in enumerate(urls, 1):
+                            self.status = f"Читаю сайт {idx_u}/{len(urls)}..."
+                            self.add_log(1, f"  [{idx_u}/{len(urls)}] Скачиваю: {u_item}")
+                            txt = web_netget(u_item, max_chars=per_page)
+                            pages_txt.append(f"=== Сайт {idx_u}: {u_item} ===\n{txt}")
+                        if pages_txt:
+                            res += "\n\n" + "\n\n".join(pages_txt)
+                        self.add_log(8, "")
+                    self.msgs.append({"role": "user", "content": f"Результаты поиска `{q}` и тексты первых {len(urls) if self.web_search_on else 0} сайтов:\n{res}\n\n[ИНСТРУКЦИЯ: Поиск завершён. НЕ вызывай //search снова! Сразу напиши честный ответ строго по этим текстам и укажи использованные ссылки. Если нужных фактов в текстах нет — так и скажи, ничего не придумывая.]"})
+                elif a.get("netget"):
+                    u = a["netget"]
+                    self.status = f"Загрузка: {u[:18]}..."
+                    if not self.netget_on:
+                        res = "Скачивание страниц (//netget) отключено пользователем в настройках."
+                        self.add_log(3, "  ⚠ //netget отключён в настройках\n")
+                    else:
+                        self.add_log(1, f"  Скачивание страницы: {u}")
+                        res = web_netget(u, max_chars=self.netget_max)
+                        self.add_log(1, f"  ✔ Загружено {len(res)} симв.\n")
+                    self.msgs.append({"role": "user", "content": f"Содержимое `{u}`:\n{res}"})
                 elif a["need_ctx"]:
                     self.msgs.append({"role": "user", "content": self.read_last_context()})
                 elif a["cmd"]:
@@ -1973,7 +2455,13 @@ class SuperCodeTUI:
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def print_exit_banner(self):
+        os.environ["SUPERCODE_EXIT_TITLE"] = self.sess_title
+        os.environ["SUPERCODE_EXIT_SID"] = self.sess_id
+
     def run(self):
+        os.environ["SUPERCODE_EXIT_TITLE"] = self.sess_title
+        os.environ["SUPERCODE_EXIT_SID"] = self.sess_id
         self.last_esc_time = 0.0
         while True:
             self.draw()
@@ -1985,13 +2473,12 @@ class SuperCodeTUI:
             # Двойное нажатие Esc во время генерации -> прерывание
             if ch == "\x1b":
                 if self.is_busy:
-                    now = time.time()
-                    if now - self.last_esc_time < 1.2:
-                        self.abort_event.set()
-                        self.status = "Прерывание..."
-                        self.last_esc_time = 0.0
-                    else:
-                        self.last_esc_time = now
+                    self.abort_event.set()
+                    self.status = "Прерывание..."
+                    r_sock = getattr(self, "_active_resp", None)
+                    if r_sock:
+                        try: r_sock.close()
+                        except Exception: pass
                 continue
 
             # Комбинации Ctrl+X ... работают всегда (даже во время генерации)
@@ -2013,6 +2500,8 @@ class SuperCodeTUI:
                 self.open_download_modal()
             elif ch == curses.KEY_F6:
                 self.toggle_quote_run()
+            elif ch == curses.KEY_F7:
+                self.toggle_thinking()
             elif ch == "\x19":
                 self.copy_last_reply()
             elif ch == "\x02":
@@ -2047,6 +2536,9 @@ class SuperCodeTUI:
                         continue
                     if t in ("/exit", "/quit"):
                         self.save_session()
+                        os.environ["SUPERCODE_EXIT_TITLE"] = self.sess_title
+                        os.environ["SUPERCODE_EXIT_SID"] = self.sess_id
+                        self.print_exit_banner()
                         break
                     elif t == "/new":
                         self.new_session()
@@ -2101,6 +2593,7 @@ def main(argv=None):
     parser.add_argument("prompt", nargs="*", help="задача для 'run' или имя провайдера для 'auth'")
     parser.add_argument("-m", "--model", help="модель в формате provider/model")
     parser.add_argument("-p", "--preset", choices=list(PRESETS.keys()), default=None)
+    parser.add_argument("-s", "--session", default=None, help="ID сессии для продолжения")
     args = parser.parse_args(argv)
 
     cfg = load_config()
@@ -2117,7 +2610,7 @@ def main(argv=None):
         print(f"Сессии:  {SESS_DIR}")
         return 0
 
-    ref = args.model or choose_start_model(cfg)
+    ref = args.model or cfg.get("model") or choose_start_model(cfg)
     if args.command == "run":
         prompt = " ".join(args.prompt).strip()
         if not prompt:
@@ -2136,7 +2629,20 @@ def main(argv=None):
     ensure_ollama(cfg.get("providers", {}).get("ollama", {}).get("baseURL") or API_URL)
     cfg = load_config()
     ref = args.model or choose_start_model(cfg)
-    curses.wrapper(SuperCodeTUI, cfg, ref)
+    if args.session:
+        os.environ["SUPERCODE_START_SID"] = args.session
+    try:
+        curses.wrapper(SuperCodeTUI, cfg, ref)
+    except KeyboardInterrupt:
+        pass
+    sid = os.environ.get("SUPERCODE_EXIT_SID", "")
+    title = os.environ.get("SUPERCODE_EXIT_TITLE", "Новая сессия")
+    if sid:
+        print()
+        for ln in LOGO:
+            print(f"\033[1;37m{ln}\033[0m")
+        print(f"\n\033[90mSession   \033[0m\033[1m{title}\033[0m")
+        print(f"\033[90mContinue  \033[0m\033[37msupercode -s {sid}\033[0m\n")
     return 0
 
 
